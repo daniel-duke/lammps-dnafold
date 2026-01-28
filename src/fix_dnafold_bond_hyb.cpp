@@ -1,0 +1,725 @@
+/* ----------------------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   https://www.lammps.org/, Sandia National Laboratories
+   LAMMPS development team: developers@lammps.org
+
+   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+   certain rights in this software.  This software is distributed under
+   the GNU General Public License.
+
+   See the README file in the top-level LAMMPS directory.
+------------------------------------------------------------------------- */
+
+#include "fix_dnafold_bond_hyb.h"
+
+#include "atom.h"
+#include "comm.h"
+#include "domain.h"
+#include "error.h"
+#include "force.h"
+#include "group.h"
+#include "memory.h"
+#include "modify.h"
+#include "neighbor.h"
+#include "neigh_list.h"
+#include "neigh_request.h"
+#include "update.h"
+#include "special.h"
+
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <vector>
+
+using namespace LAMMPS_NS;
+using namespace FixConst;
+
+static constexpr double BIG = 1.0e20;
+static constexpr double EPSILON = 1.0e-10;  // Tolerance for floating point comparisons
+
+FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
+  Fix(lmp, narg, arg), complementarity_file(nullptr),
+  partner(nullptr), finalpartner(nullptr), partnerbtype(nullptr), distsq(nullptr)
+{
+  if (narg != 7) error->all(FLERR,"Illegal fix dnafold/bond/hyb command");
+
+  MPI_Comm_rank(world,&me);
+  MPI_Comm_size(world,&nprocs);
+
+  nevery = utils::inumeric(FLERR,arg[3],false,lmp);
+  if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/bond/hyb command");
+
+  force_reneighbor = 1;
+  next_reneighbor = update->ntimestep + 1;
+  vector_flag = 1;
+  size_vector = 4;  // create, total create, downgrade, total downgrade
+  global_freq = 1;
+  extvector = 0;
+  
+  comm_forward = 3;  // partner tag, bond type, and distance squared
+  comm_reverse = 3;  // partner tag, bond type, and distance squared
+
+  // Bonds form between type 1 and type 2 atoms only
+  iatomtype = 1;
+  jatomtype = 2;
+
+  cutoffsq = utils::numeric(FLERR,arg[4],false,lmp);
+  if (cutoffsq <= 0.0) error->all(FLERR,"Illegal cutoff");
+  cutoffsq = cutoffsq * cutoffsq;
+
+  dummy_btype = utils::inumeric(FLERR,arg[5],false,lmp);
+  if (dummy_btype <= 0) error->all(FLERR,"Illegal dummy bond type");
+
+  complementarity_file = utils::strdup(arg[6]);
+
+  createcount = 0;
+  downgradecount = 0;
+  createcounttotal = 0;
+  downgradecounttotal = 0;
+  
+  nmax = 0;
+  
+  // Read complementarity file - only rank 0 reads, then broadcasts
+  read_complementarity_file();
+}
+
+FixDnafoldBondHyb::~FixDnafoldBondHyb()
+{
+  delete[] complementarity_file;
+  memory->destroy(partner);
+  memory->destroy(finalpartner);
+  memory->destroy(partnerbtype);
+  memory->destroy(distsq);
+}
+
+int FixDnafoldBondHyb::setmask()
+{
+  int mask = 0;
+  mask |= POST_INTEGRATE;
+  return mask;
+}
+
+void FixDnafoldBondHyb::init()
+{
+  // Find the d_hyb_status property (now a double)
+  int flag_hyb, cols_hyb;
+  property_flag_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
+  if (property_flag_index < 0)
+    error->all(FLERR,fmt::format("Could not find property 'd_hyb_status'"));
+  if (flag_hyb != 1)
+    error->all(FLERR,fmt::format("Property 'd_hyb_status' must be double"));
+
+  // Find the d_size property
+  int flag_size, cols_size;
+  size_index = atom->find_custom("size", flag_size, cols_size);
+  if (size_index < 0)
+    error->all(FLERR,fmt::format("Could not find property 'd_size'"));
+  if (flag_size != 1)
+    error->all(FLERR,fmt::format("Property 'd_size' must be double"));
+
+  if (atom->molecular != Atom::MOLECULAR)
+    error->all(FLERR,"Cannot use fix dnafold/bond/hyb with non-molecular system");
+  
+  if (force->bond == nullptr)
+    error->all(FLERR,"Must define bond_style");
+
+  if (force->newton_bond == 0)
+    error->all(FLERR,"Fix dnafold/bond/hyb requires newton bond on");
+}
+
+void FixDnafoldBondHyb::setup(int /* vflag */)
+{
+  post_integrate();
+}
+
+void FixDnafoldBondHyb::read_complementarity_file()
+{
+  // Only rank 0 reads the file
+  if (me == 0) {
+    std::ifstream file(complementarity_file);
+    if (!file.is_open()) 
+      error->one(FLERR,fmt::format("Cannot open complementarity file '{}'", complementarity_file));
+    
+    std::string line;
+    int line_num = 0;
+    while (std::getline(file, line)) {
+      line_num++;
+      // Skip empty lines and comments
+      if (line.empty() || line[0] == '#') continue;
+      
+      std::istringstream iss(line);
+      tagint tag1, tag2;
+      int btype;
+      
+      if (!(iss >> tag1 >> tag2 >> btype)) {
+        error->one(FLERR,fmt::format("Invalid format in complementarity file '{}' at line {}", 
+                                     complementarity_file, line_num));
+      }
+      
+      // Ensure tag1 < tag2 for consistent lookup
+      if (tag1 > tag2) std::swap(tag1, tag2);
+      
+      if (btype <= 0) {
+        error->one(FLERR,fmt::format("Invalid bond type {} in complementarity file at line {}", 
+                                     btype, line_num));
+      }
+      
+      // Store in map
+      complementarity_map[std::make_pair(tag1, tag2)] = btype;
+    }
+    
+    file.close();
+    
+    if (complementarity_map.empty()) {
+      error->warning(FLERR,"Complementarity file '{}' contains no valid pairs", complementarity_file);
+    }
+  }
+  
+  // Broadcast map size
+  int map_size = complementarity_map.size();
+  MPI_Bcast(&map_size, 1, MPI_INT, 0, world);
+  
+  // Broadcast map contents
+  if (map_size > 0) {
+    std::vector<tagint> tags1(map_size);
+    std::vector<tagint> tags2(map_size);
+    std::vector<int> btypes(map_size);
+    
+    if (me == 0) {
+      int idx = 0;
+      for (const auto &entry : complementarity_map) {
+        tags1[idx] = entry.first.first;
+        tags2[idx] = entry.first.second;
+        btypes[idx] = entry.second;
+        idx++;
+      }
+    }
+    
+    MPI_Bcast(tags1.data(), map_size, MPI_LMP_TAGINT, 0, world);
+    MPI_Bcast(tags2.data(), map_size, MPI_LMP_TAGINT, 0, world);
+    MPI_Bcast(btypes.data(), map_size, MPI_INT, 0, world);
+    
+    if (me != 0) {
+      for (int i = 0; i < map_size; i++) {
+        complementarity_map[std::make_pair(tags1[i], tags2[i])] = btypes[i];
+      }
+    }
+  }
+  
+  if (me == 0) {
+    if (screen) 
+      fprintf(screen,"Fix dnafold/bond/hyb: Read %d complementarity pairs from '%s'\n",
+              map_size, complementarity_file);
+    if (logfile) 
+      fprintf(logfile,"Fix dnafold/bond/hyb: Read %d complementarity pairs from '%s'\n",
+              map_size, complementarity_file);
+  }
+}
+
+int FixDnafoldBondHyb::get_bond_type(tagint tag_i, tagint tag_j)
+{
+  // Ensure tag1 < tag2 for consistent lookup
+  tagint tag1 = (tag_i < tag_j) ? tag_i : tag_j;
+  tagint tag2 = (tag_i < tag_j) ? tag_j : tag_i;
+  
+  auto it = complementarity_map.find(std::make_pair(tag1, tag2));
+  if (it != complementarity_map.end()) {
+    return it->second;  // Return bond type
+  }
+  return 0;  // Not complementary
+}
+
+void FixDnafoldBondHyb::post_integrate()
+{
+  int i,j,m;
+  double xtmp,ytmp,ztmp,delx,dely,delz,rsq;
+  int itype, jtype, btype_ij;
+  tagint itag, jtag;
+
+  if (update->ntimestep % nevery) return;
+
+  double *hyb_status = atom->dvector[property_flag_index];
+  double *size = atom->dvector[size_index];
+  
+  // Acquire updated ghost atom positions and properties
+  // This ensures ghosts have current coordinates and custom properties
+  comm->forward_comm();
+
+  // Resize partner arrays if needed
+  if (atom->nmax > nmax) {
+    memory->destroy(partner);
+    memory->destroy(finalpartner);
+    memory->destroy(partnerbtype);
+    memory->destroy(distsq);
+    nmax = atom->nmax;
+    memory->create(partner, nmax, "dnafold/bond/hyb:partner");
+    memory->create(finalpartner, nmax, "dnafold/bond/hyb:finalpartner");
+    memory->create(partnerbtype, nmax, "dnafold/bond/hyb:partnerbtype");
+    memory->create(distsq, nmax, "dnafold/bond/hyb:distsq");
+  }
+
+  int nlocal = atom->nlocal;
+  int nall = atom->nlocal + atom->nghost;
+  double **x = atom->x;
+  tagint *tag = atom->tag;
+  int *mask = atom->mask;
+  int *type = atom->type;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+
+  // Initialize partner arrays for all atoms (local + ghost)
+  for (i = 0; i < nall; i++) {
+    partner[i] = 0;
+    finalpartner[i] = 0;
+    partnerbtype[i] = 0;
+    distsq[i] = BIG;
+  }
+
+  // First pass: downgrade hyb bonds that are too far apart back to dummy bonds
+  int downgradecount = 0;
+  std::vector<tagint> downgraded_type1_tags;  // Track type 1 atoms that were downgraded
+  
+  for (i = 0; i < nlocal; i++) {
+    if (!(mask[i] & groupbit)) continue;
+    
+    itype = type[i];
+    if (itype != iatomtype && itype != jatomtype) continue;
+    
+    // Only check atoms with hyb_status > 0 (have hybridized bonds)
+    if (hyb_status[i] <= EPSILON) continue;
+    
+    itag = tag[i];
+    xtmp = x[i][0];
+    ytmp = x[i][1];
+    ztmp = x[i][2];
+    
+    // Loop through i's bonds looking for hyb bonds
+    int ib = 0;
+    while (ib < num_bond[i]) {
+      // Get bond type for this pair from complementarity map
+      jtag = bond_atom[i][ib];
+      btype_ij = get_bond_type(itag, jtag);
+      
+      // Skip if this is not a hyb bond (it's either dummy or non-complementary bond)
+      if (btype_ij == 0 || bond_type[i][ib] != btype_ij) {
+        ib++;
+        continue;
+      }
+      
+      // This is a hyb bond - check distance
+      j = atom->map(jtag);
+      if (j < 0) {
+        // Partner not found - downgrade to dummy
+        bond_type[i][ib] = dummy_btype;
+        
+        // Calculate min_size - need to get j's size somehow, but j not found
+        // Best we can do is subtract size[i] (assumes worst case)
+        hyb_status[i] -= size[i];
+        
+        // If i is type 1, mark for angle removal
+        if (itype == iatomtype) {
+          downgraded_type1_tags.push_back(itag);
+        }
+        
+        downgradecount++;
+        ib++;
+        continue;
+      }
+      
+      // Check distance with minimum image convention
+      delx = xtmp - x[j][0];
+      dely = ytmp - x[j][1];
+      delz = ztmp - x[j][2];
+      if (domain->xperiodic) {
+        if (delx > domain->xprd_half) delx -= domain->xprd;
+        else if (delx < -domain->xprd_half) delx += domain->xprd;
+      }
+      if (domain->yperiodic) {
+        if (dely > domain->yprd_half) dely -= domain->yprd;
+        else if (dely < -domain->yprd_half) dely += domain->yprd;
+      }
+      if (domain->zperiodic) {
+        if (delz > domain->zprd_half) delz -= domain->zprd;
+        else if (delz < -domain->zprd_half) delz += domain->zprd;
+      }
+      rsq = delx*delx + dely*dely + delz*delz;
+      
+      if (rsq > cutoffsq) {
+        // Too far - downgrade to dummy bond
+        bond_type[i][ib] = dummy_btype;
+        
+        // Calculate min_size and subtract from hyb_status for both atoms
+        double min_size = (size[i] < size[j]) ? size[i] : size[j];
+        hyb_status[i] -= min_size;
+        
+        // Also update j's hyb_status if j is local
+        if (j < nlocal) hyb_status[j] -= min_size;
+        
+        // If i is type 1, mark for angle removal
+        if (itype == iatomtype) {
+          downgraded_type1_tags.push_back(itag);
+        }
+        
+        downgradecount++;
+      }
+      
+      ib++;
+    }
+  }
+
+  // Gather all downgraded type 1 tags across processors for angle removal
+  int nlocal_downgraded = downgraded_type1_tags.size();
+  int ntotal_downgraded = 0;
+  MPI_Allreduce(&nlocal_downgraded, &ntotal_downgraded, 1, MPI_INT, MPI_SUM, world);
+  
+  std::vector<tagint> all_downgraded_type1_tags;
+  if (ntotal_downgraded > 0) {
+    // Gather counts from all processors
+    std::vector<int> recvcounts(nprocs);
+    MPI_Allgather(&nlocal_downgraded, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
+    
+    // Calculate displacements
+    std::vector<int> displs(nprocs);
+    displs[0] = 0;
+    for (int p = 1; p < nprocs; p++) {
+      displs[p] = displs[p-1] + recvcounts[p-1];
+    }
+    
+    // Gather all tags
+    all_downgraded_type1_tags.resize(ntotal_downgraded);
+    MPI_Allgatherv(downgraded_type1_tags.data(), nlocal_downgraded, MPI_LMP_TAGINT,
+                   all_downgraded_type1_tags.data(), recvcounts.data(), displs.data(),
+                   MPI_LMP_TAGINT, world);
+  }
+
+  // Remove angles involving any downgraded type 1 atoms
+  if (ntotal_downgraded > 0) {
+    int **angle_type = atom->angle_type;
+    tagint **angle_atom1 = atom->angle_atom1;
+    tagint **angle_atom2 = atom->angle_atom2;
+    tagint **angle_atom3 = atom->angle_atom3;
+    int *num_angle = atom->num_angle;
+    
+    // Loop through all local atoms' angles
+    for (i = 0; i < nlocal; i++) {
+      int ia = 0;
+      while (ia < num_angle[i]) {
+        bool should_remove = false;
+        
+        // Check if any of the three atoms in this angle match a downgraded type 1 atom
+        for (tagint downgraded_tag : all_downgraded_type1_tags) {
+          if (angle_atom1[i][ia] == downgraded_tag ||
+              angle_atom2[i][ia] == downgraded_tag ||
+              angle_atom3[i][ia] == downgraded_tag) {
+            should_remove = true;
+            break;
+          }
+        }
+        
+        if (should_remove) {
+          // Remove angle by shifting remaining angles down
+          for (int k = ia; k < num_angle[i] - 1; k++) {
+            angle_type[i][k] = angle_type[i][k+1];
+            angle_atom1[i][k] = angle_atom1[i][k+1];
+            angle_atom2[i][k] = angle_atom2[i][k+1];
+            angle_atom3[i][k] = angle_atom3[i][k+1];
+          }
+          num_angle[i]--;
+          // Don't increment ia since we shifted
+        } else {
+          ia++;
+        }
+      }
+    }
+  }
+
+  // Second pass: upgrade dummy bonds to hyb bonds when within cutoff
+  // Partner selection based on distance (closest complementary partner with dummy bond)
+  for (i = 0; i < nlocal; i++) {
+    
+    if (!(mask[i] & groupbit)) continue;
+    
+    // Skip if atom i already at full capacity
+    if (hyb_status[i] >= 1.0 - EPSILON) continue;
+    
+    // Atom i must be type 1 or type 2
+    itype = type[i];
+    if (itype != iatomtype && itype != jatomtype) continue;
+
+    itag = tag[i];
+    xtmp = x[i][0];
+    ytmp = x[i][1];
+    ztmp = x[i][2];
+
+    // Loop through i's bonds looking for dummy bonds
+    for (int k = 0; k < num_bond[i]; k++) {
+      // Skip if not a dummy bond
+      if (bond_type[i][k] != dummy_btype) continue;
+      
+      // Get partner atom
+      jtag = bond_atom[i][k];
+      j = atom->map(jtag);
+      
+      if (j < 0) continue;  // Partner not found
+      
+      if (!(mask[j] & groupbit)) continue;
+      
+      // Skip if atom j already at full capacity
+      if (hyb_status[j] >= 1.0 - EPSILON) continue;
+
+      // Atom j must be the opposite type from i
+      jtype = type[j];
+      if (itype == iatomtype && jtype != jatomtype) continue;
+      if (itype == jatomtype && jtype != iatomtype) continue;
+
+      // Check distance with minimum image convention
+      delx = xtmp - x[j][0];
+      dely = ytmp - x[j][1];
+      delz = ztmp - x[j][2];
+      if (domain->xperiodic) {
+        if (delx > domain->xprd_half) delx -= domain->xprd;
+        else if (delx < -domain->xprd_half) delx += domain->xprd;
+      }
+      if (domain->yperiodic) {
+        if (dely > domain->yprd_half) dely -= domain->yprd;
+        else if (dely < -domain->yprd_half) dely += domain->yprd;
+      }
+      if (domain->zperiodic) {
+        if (delz > domain->zprd_half) delz -= domain->zprd;
+        else if (delz < -domain->zprd_half) delz += domain->zprd;
+      }
+      rsq = delx*delx + dely*dely + delz*delz;
+      if (rsq > cutoffsq) continue;
+
+      // Check if this pair is complementary and get bond type
+      btype_ij = get_bond_type(itag, jtag);
+      if (btype_ij == 0) continue;  // Not complementary (shouldn't happen if dummy bond exists)
+
+      // Check capacity constraint
+      double min_size = (size[i] < size[j]) ? size[i] : size[j];
+      if (hyb_status[i] + min_size > 1.0 + EPSILON) continue;
+      if (hyb_status[j] + min_size > 1.0 + EPSILON) continue;
+
+      // Update partner for atom i if this is closer
+      if (rsq < distsq[i]) {
+        partner[i] = jtag;
+        partnerbtype[i] = btype_ij;
+        distsq[i] = rsq;
+      }
+      
+      // Update partner for atom j if this is closer
+      // This is safe even if j is a ghost - we'll communicate this back
+      if (rsq < distsq[j]) {
+        partner[j] = itag;
+        partnerbtype[j] = btype_ij;
+        distsq[j] = rsq;
+      }
+    }
+  }
+
+  // Reverse comm of partner, partnerbtype, and distsq
+  // Send ghost atom data back to home processors
+  // Home processor will keep the closest partner
+  commflag = 1;
+  if (force->newton_pair) comm->reverse_comm(this);
+
+  // Forward comm of partner, partnerbtype, and distsq, so ghosts have final values
+  // This ensures all atoms (local and ghost) know about finalized partners
+  commflag = 1;
+  comm->forward_comm(this);
+
+  // Create bonds for atoms I own
+  // Only if both atoms list each other as winning bond partner
+
+  createcount = 0;
+  for (i = 0; i < nlocal; i++) {
+    if (partner[i] == 0) continue;
+    
+    // Map partner tag to local or ghost index
+    j = atom->map(partner[i]);
+    if (j < 0) 
+      error->one(FLERR,"Fix dnafold/bond/hyb: partner atom not found - ghost cutoff may be too small");
+    
+    // Both atoms must agree on being partners
+    if (partner[j] != tag[i]) continue;
+
+    // With newton_bond on, only store bond on lower-tagged atom
+    // This prevents duplicate bond creation across processors
+    if (tag[i] > tag[j]) continue;
+
+    if (num_bond[i] >= atom->bond_per_atom)
+      error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/hyb");
+
+    // Create the bond with the bond type from the complementarity map
+    bond_type[i][num_bond[i]] = partnerbtype[i];
+    bond_atom[i][num_bond[i]] = tag[j];
+    num_bond[i]++;
+
+    // Remove any dummy bond between i and j
+    remove_dummy_bond(i, j);
+
+    // Calculate min_size and add to hyb_status for both atoms
+    double min_size = (size[i] < size[j]) ? size[i] : size[j];
+    hyb_status[i] += min_size;
+    
+    // Also update j's hyb_status
+    // This is safe even if j is ghost because:
+    // 1. If j is local, we're setting it directly
+    // 2. If j is ghost, j's home processor will also create this same bond
+    //    (because both atoms agree on partnership) and set the hyb_status there
+    hyb_status[j] += min_size;
+
+    // Store final partners for bookkeeping
+    finalpartner[i] = tag[j];
+    
+    createcount++;
+  }
+
+  int createcountall, downgradecountall;
+  MPI_Allreduce(&createcount,&createcountall,1,MPI_INT,MPI_SUM,world);
+  MPI_Allreduce(&downgradecount,&downgradecountall,1,MPI_INT,MPI_SUM,world);
+  createcounttotal += createcountall;
+  downgradecounttotal += downgradecountall;
+  createcount = createcountall;
+  downgradecount = downgradecountall;
+
+  // If any bonds were created or downgraded, rebuild special lists and trigger reneighboring
+  if (createcount || downgradecount) {
+    next_reneighbor = update->ntimestep;
+    Special special(lmp);
+    special.build();
+  }
+}
+
+int FixDnafoldBondHyb::bond_exists(int i, int j)
+{
+  int **nspecial = atom->nspecial;
+  tagint **special = atom->special;
+  tagint jtag = atom->tag[j];
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+
+  // Check if j is in i's 1-2 neighbor list (special bonds)
+  // Ignore dummy bonds - they don't count as existing bonds
+  for (int k = 0; k < nspecial[i][0]; k++) {
+    if (special[i][k] == jtag) {
+      // Found in special list, but check if it's a dummy bond
+      // Look through i's bonds to find the bond to j
+      for (int m = 0; m < num_bond[i]; m++) {
+        if (bond_atom[i][m] == jtag) {
+          if (bond_type[i][m] == dummy_btype) {
+            return 0;  // It's a dummy bond, doesn't count
+          }
+          return 1;  // It's a real bond
+        }
+      }
+      // In special list but bond not found in num_bond - shouldn't happen
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int FixDnafoldBondHyb::pack_forward_comm(int n, int *list, double *buf, 
+                                          int /* pbc_flag */, int * /* pbc */)
+{
+  int i,j,m;
+
+  m = 0;
+  for (i = 0; i < n; i++) {
+    j = list[i];
+    buf[m++] = ubuf(partner[j]).d;
+    buf[m++] = ubuf(partnerbtype[j]).d;
+    buf[m++] = distsq[j];
+  }
+  return m;
+}
+
+void FixDnafoldBondHyb::unpack_forward_comm(int n, int first, double *buf)
+{
+  int i,m,last;
+
+  m = 0;
+  last = first + n;
+  for (i = first; i < last; i++) {
+    partner[i] = (tagint) ubuf(buf[m++]).i;
+    partnerbtype[i] = (int) ubuf(buf[m++]).i;
+    distsq[i] = buf[m++];
+  }
+}
+
+int FixDnafoldBondHyb::pack_reverse_comm(int n, int first, double *buf)
+{
+  int i,m,last;
+
+  m = 0;
+  last = first + n;
+  for (i = first; i < last; i++) {
+    buf[m++] = ubuf(partner[i]).d;
+    buf[m++] = ubuf(partnerbtype[i]).d;
+    buf[m++] = distsq[i];
+  }
+  return m;
+}
+
+void FixDnafoldBondHyb::unpack_reverse_comm(int n, int *list, double *buf)
+{
+  int i,j,m;
+
+  m = 0;
+  for (i = 0; i < n; i++) {
+    j = list[i];
+    // Keep the closer partner (smaller distance)
+    if (buf[m+2] < distsq[j]) {
+      partner[j] = (tagint) ubuf(buf[m++]).i;
+      partnerbtype[j] = (int) ubuf(buf[m++]).i;
+      distsq[j] = buf[m++];
+    } else m += 3;
+  }
+}
+
+void FixDnafoldBondHyb::remove_dummy_bond(int i, int j)
+{
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+  tagint jtag = atom->tag[j];
+
+  // Look through i's bonds to find dummy bond to j
+  for (int k = 0; k < num_bond[i]; k++) {
+    if (bond_atom[i][k] == jtag && bond_type[i][k] == dummy_btype) {
+      // Found dummy bond - remove it by shifting remaining bonds down
+      for (int m = k; m < num_bond[i] - 1; m++) {
+        bond_type[i][m] = bond_type[i][m+1];
+        bond_atom[i][m] = bond_atom[i][m+1];
+      }
+      num_bond[i]--;
+      return;
+    }
+  }
+}
+
+double FixDnafoldBondHyb::compute_vector(int n)
+{
+  if (n == 0) return (double) createcount;
+  if (n == 1) return (double) createcounttotal;
+  if (n == 2) return (double) downgradecount;
+  return (double) downgradecounttotal;
+}
+
+double FixDnafoldBondHyb::memory_usage()
+{
+  double bytes = (double)nmax * 2 * sizeof(tagint);  // partner, finalpartner
+  bytes += (double)nmax * sizeof(int);                // partnerbtype
+  bytes += (double)nmax * sizeof(double);             // distsq
+  
+  // Estimate map memory (rough approximation)
+  bytes += complementarity_map.size() * (2 * sizeof(tagint) + sizeof(int) + 32);
+  
+  return bytes;
+}
+
