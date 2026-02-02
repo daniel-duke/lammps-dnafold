@@ -51,6 +51,8 @@ class FixDnafoldBondPre : public Fix {
   int dummy_btype;               // dummy bond type
   double cutoffsq;               // distance cutoff squared
   char *complementarity_file;    // file containing complementarity pairs
+  int hyb_status_index;          // index for i_hyb_status in atom->ivector
+  int size_index;                // index for i_size in atom->ivector
   int createcount;               // bonds created this timestep
   int removecount;               // bonds removed this timestep
   bigint createcounttotal;       // cumulative bonds created

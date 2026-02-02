@@ -89,6 +89,22 @@ int FixDnafoldBondPre::setmask()
 
 void FixDnafoldBondPre::init()
 {
+  // Find the i_hyb_status property (now an integer)
+  int flag_hyb, cols_hyb;
+  hyb_status_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
+  if (hyb_status_index < 0)
+    error->all(FLERR,"Could not find i_hyb_status property for fix dnafold/bond/pre");
+  if (flag_hyb != 0)
+    error->all(FLERR,"Property i_hyb_status must be integer");
+
+  // Find the i_size property (now an integer)
+  int flag_size, cols_size;
+  size_index = atom->find_custom("size", flag_size, cols_size);
+  if (size_index < 0)
+    error->all(FLERR,"Could not find i_size property for fix dnafold/bond/pre");
+  if (flag_size != 0)
+    error->all(FLERR,"Property i_size must be integer");
+
   neighbor->add_request(this, NeighConst::REQ_OCCASIONAL);
 
   if (atom->molecular != Atom::MOLECULAR)
@@ -124,25 +140,58 @@ void FixDnafoldBondPre::read_complementarity_file()
     
     std::string line;
     int line_num = 0;
+    enum Section { NONE, TYPES, PAIRS };
+    Section current_section = NONE;
+    
     while (std::getline(file, line)) {
       line_num++;
-      // Skip empty lines and comments
-      if (line.empty() || line[0] == '#') continue;
       
-      std::istringstream iss(line);
-      tagint tag1, tag2;
-      int btype;  // We read it but don't store it
+      // Skip empty lines
+      if (line.empty()) continue;
       
-      if (!(iss >> tag1 >> tag2 >> btype)) {
-        error->one(FLERR,fmt::format("Invalid format in complementarity file '{}' at line {}", 
-                                     complementarity_file, line_num));
+      // Skip comment lines (lines starting with #)
+      if (line[0] == '#') continue;
+      
+      // Trim leading whitespace for section detection
+      size_t start = line.find_first_not_of(" \t");
+      if (start == std::string::npos) continue;  // All whitespace
+      std::string trimmed = line.substr(start);
+      
+      // Check for section headers
+      if (trimmed == "TYPES") {
+        current_section = TYPES;
+        continue;
+      } else if (trimmed == "PAIRS") {
+        current_section = PAIRS;
+        continue;
       }
       
-      // Ensure tag1 < tag2 for consistent lookup
-      if (tag1 > tag2) std::swap(tag1, tag2);
+      // Skip TYPES section (bond_pre doesn't need it)
+      if (current_section == TYPES) {
+        continue;
+      }
       
-      // Store in set (we only care if pair exists, not the bond type)
-      complementarity_set.insert(std::make_pair(tag1, tag2));
+      // Parse PAIRS section
+      if (current_section == PAIRS) {
+        std::istringstream iss(line);
+        tagint tag1, tag2;
+        double energy;  // Read but don't store
+        
+        if (!(iss >> tag1 >> tag2 >> energy)) {
+          error->one(FLERR,fmt::format("Invalid PAIRS format in '{}' at line {}", 
+                                       complementarity_file, line_num));
+        }
+        
+        // Ensure tag1 < tag2 for consistent lookup
+        if (tag1 > tag2) std::swap(tag1, tag2);
+        
+        // Store in set (we only care if pair exists, not the energy)
+        complementarity_set.insert(std::make_pair(tag1, tag2));
+        
+      } else {
+        error->one(FLERR,fmt::format("Line {} in '{}' appears before any section header", 
+                                     line_num, complementarity_file));
+      }
     }
     
     file.close();
@@ -312,6 +361,11 @@ void FixDnafoldBondPre::post_integrate()
   }
 
   // Second pass: create new dummy bonds for complementary pairs within cutoff
+  
+  // Get property arrays
+  int *hyb_status = atom->ivector[hyb_status_index];
+  int *size = atom->ivector[size_index];
+  
   for (ii = 0; ii < inum; ii++) {
     i = ilist[ii];
     
@@ -366,6 +420,11 @@ void FixDnafoldBondPre::post_integrate()
 
       // Check if dummy bond already exists
       if (dummy_bond_exists(i, j)) continue;
+      
+      // Check capacity constraint
+      int min_size = (size[i] < size[j]) ? size[i] : size[j];
+      if (hyb_status[i] + min_size > 2) continue;
+      if (hyb_status[j] + min_size > 2) continue;
 
       // Only create bond on lower-tagged atom (with newton_bond on)
       if (itag > jtag) continue;

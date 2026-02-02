@@ -53,16 +53,20 @@ class FixDnafoldBondHyb : public Fix {
   int dummy_btype;               // dummy bond type to ignore/remove
   double cutoffsq;               // distance cutoff squared
   char *complementarity_file;    // file containing complementarity pairs and bond types
-  int property_flag_index;       // index for d_hyb_status in atom->dvector
-  int size_index;                // index for d_size in atom->dvector
+  int property_flag_index;       // index for i_hyb_status in atom->ivector
+  int size_index;                // index for i_size in atom->ivector
   int createcount;               // bonds created this timestep
   int downgradecount;            // bonds downgraded this timestep
   bigint createcounttotal;       // cumulative bonds created
   bigint downgradecounttotal;    // cumulative bonds downgraded
 
-  // Complementarity map: (tag1, tag2) -> bond_type
+  // Complementarity map: (tag1, tag2) -> energy_depth
   // tag1 < tag2 always
-  std::unordered_map<std::pair<tagint, tagint>, int, PairHash> complementarity_map;
+  std::unordered_map<std::pair<tagint, tagint>, double, PairHash> complementarity_map;
+  
+  // Energy levels: sorted pairs of (energy_depth, bond_type)
+  // Sorted in descending order by energy_depth
+  std::vector<std::pair<double, int>> energy_levels;
 
   // Arrays for partner selection across processors
   int nmax;                      // size of per-atom arrays

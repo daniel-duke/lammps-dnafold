@@ -78,29 +78,29 @@ int FixDnafoldAngleHyb::setmask()
 
 void FixDnafoldAngleHyb::init()
 {
-  // Find the d_hyb_status property
+  // Find the i_hyb_status property (now an integer)
   int flag_hyb, cols_hyb;
   hyb_status_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
   if (hyb_status_index < 0)
-    error->all(FLERR,"Could not find d_hyb_status property for fix dnafold/angle/hyb");
-  if (flag_hyb != 1)
-    error->all(FLERR,"Property d_hyb_status must be a double property");
+    error->all(FLERR,"Could not find i_hyb_status property for fix dnafold/angle/hyb");
+  if (flag_hyb != 0)
+    error->all(FLERR,"Property i_hyb_status must be an integer property");
 
-  // Find the d_is_crossover property
+  // Find the i_is_crossover property (now an integer)
   int flag_cross, cols_cross;
   is_crossover_index = atom->find_custom("is_crossover", flag_cross, cols_cross);
   if (is_crossover_index < 0)
-    error->all(FLERR,"Could not find d_is_crossover property for fix dnafold/angle/hyb");
-  if (flag_cross != 1)
-    error->all(FLERR,"Property d_is_crossover must be a double property");
+    error->all(FLERR,"Could not find i_is_crossover property for fix dnafold/angle/hyb");
+  if (flag_cross != 0)
+    error->all(FLERR,"Property i_is_crossover must be an integer property");
 
-  // Find the d_size property
+  // Find the i_size property (now an integer)
   int flag_size, cols_size;
   size_index = atom->find_custom("size", flag_size, cols_size);
   if (size_index < 0)
-    error->all(FLERR,"Could not find d_size property for fix dnafold/angle/hyb");
-  if (flag_size != 1)
-    error->all(FLERR,"Property d_size must be a double property");
+    error->all(FLERR,"Could not find i_size property for fix dnafold/angle/hyb");
+  if (flag_size != 0)
+    error->all(FLERR,"Property i_size must be an integer property");
 
   // Verify system supports angles
   if (atom->molecular != Atom::MOLECULAR)
@@ -146,10 +146,10 @@ void FixDnafoldAngleHyb::find_and_create_angles()
   int **angle_atom3 = atom->angle_atom3;
   int *num_angle = atom->num_angle;
   
-  // Get property arrays as doubles
-  double *hyb_status = atom->dvector[hyb_status_index];
-  double *is_crossover = atom->dvector[is_crossover_index];
-  double *size = atom->dvector[size_index];
+  // Get property arrays as integers
+  int *hyb_status = atom->ivector[hyb_status_index];
+  int *is_crossover = atom->ivector[is_crossover_index];
+  int *size = atom->ivector[size_index];
   
   // Get special bond arrays
   tagint **special = atom->special;
@@ -163,13 +163,12 @@ void FixDnafoldAngleHyb::find_and_create_angles()
     if (!(mask[i] & groupbit)) continue;
     
     // Only create angles if hyb_status equals size (fully hybridized)
-    if (fabs(hyb_status[i] - size[i]) > EPSILON) continue;
+    if (hyb_status[i] != size[i]) continue;
 
     tagint itag = tag[i];
     
     // Calculate angle type for this central atom: atype = 1 + is_crossover[i]
-    // Round is_crossover to nearest integer in case it's stored as double
-    int atype = 1 + (int)(is_crossover[i] + 0.5);
+    int atype = 1 + is_crossover[i];
     
     // Verify angle type is valid
     if (atype <= 0 || atype > atom->nangletypes)
@@ -187,7 +186,7 @@ void FixDnafoldAngleHyb::find_and_create_angles()
       if (!(mask[nloc] & groupbit)) continue;
       
       // Neighbor must also be fully hybridized
-      if (fabs(hyb_status[nloc] - size[nloc]) > EPSILON) continue;
+      if (hyb_status[nloc] != size[nloc]) continue;
       
       valid_neighbors.push_back(nloc);
     }

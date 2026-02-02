@@ -24,8 +24,6 @@ FixStyle(dnafold/angle/hyb,FixDnafoldAngleHyb);
 
 namespace LAMMPS_NS {
 
-static constexpr double EPSILON = 1.0e-10;  // Tolerance for floating point comparisons
-
 class FixDnafoldAngleHyb : public Fix {
  public:
   FixDnafoldAngleHyb(class LAMMPS *, int, char **);
@@ -39,9 +37,9 @@ class FixDnafoldAngleHyb : public Fix {
 
  private:
   int me, nprocs;
-  int hyb_status_index;          // index for d_hyb_status in atom->dvector
-  int is_crossover_index;        // index for d_is_crossover in atom->dvector
-  int size_index;                // index for d_size in atom->dvector
+  int hyb_status_index;          // index for i_hyb_status in atom->ivector
+  int is_crossover_index;        // index for i_is_crossover in atom->ivector
+  int size_index;                // index for i_size in atom->ivector
   int createcount;               // angles created this timestep
   bigint createcounttotal;       // cumulative angles created
 

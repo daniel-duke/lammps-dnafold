@@ -37,7 +37,6 @@ using namespace LAMMPS_NS;
 using namespace FixConst;
 
 static constexpr double BIG = 1.0e20;
-static constexpr double EPSILON = 1.0e-10;  // Tolerance for floating point comparisons
 
 FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), complementarity_file(nullptr),
@@ -103,21 +102,21 @@ int FixDnafoldBondHyb::setmask()
 
 void FixDnafoldBondHyb::init()
 {
-  // Find the d_hyb_status property (now a double)
+  // Find the i_hyb_status property (now an integer)
   int flag_hyb, cols_hyb;
   property_flag_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
   if (property_flag_index < 0)
-    error->all(FLERR,fmt::format("Could not find property 'd_hyb_status'"));
-  if (flag_hyb != 1)
-    error->all(FLERR,fmt::format("Property 'd_hyb_status' must be double"));
+    error->all(FLERR,fmt::format("Could not find property 'i_hyb_status'"));
+  if (flag_hyb != 0)
+    error->all(FLERR,fmt::format("Property 'i_hyb_status' must be integer"));
 
-  // Find the d_size property
+  // Find the i_size property (now an integer)
   int flag_size, cols_size;
   size_index = atom->find_custom("size", flag_size, cols_size);
   if (size_index < 0)
-    error->all(FLERR,fmt::format("Could not find property 'd_size'"));
-  if (flag_size != 1)
-    error->all(FLERR,fmt::format("Property 'd_size' must be double"));
+    error->all(FLERR,fmt::format("Could not find property 'i_size'"));
+  if (flag_size != 0)
+    error->all(FLERR,fmt::format("Property 'i_size' must be integer"));
 
   if (atom->molecular != Atom::MOLECULAR)
     error->all(FLERR,"Cannot use fix dnafold/bond/hyb with non-molecular system");
@@ -144,40 +143,121 @@ void FixDnafoldBondHyb::read_complementarity_file()
     
     std::string line;
     int line_num = 0;
+    enum Section { NONE, TYPES, PAIRS };
+    Section current_section = NONE;
+    
     while (std::getline(file, line)) {
       line_num++;
-      // Skip empty lines and comments
-      if (line.empty() || line[0] == '#') continue;
       
-      std::istringstream iss(line);
-      tagint tag1, tag2;
-      int btype;
+      // Skip empty lines
+      if (line.empty()) continue;
       
-      if (!(iss >> tag1 >> tag2 >> btype)) {
-        error->one(FLERR,fmt::format("Invalid format in complementarity file '{}' at line {}", 
-                                     complementarity_file, line_num));
+      // Skip comment lines (lines starting with #)
+      if (line[0] == '#') continue;
+      
+      // Trim leading whitespace for section detection
+      size_t start = line.find_first_not_of(" \t");
+      if (start == std::string::npos) continue;  // All whitespace
+      std::string trimmed = line.substr(start);
+      
+      // Check for section headers
+      if (trimmed == "TYPES") {
+        current_section = TYPES;
+        continue;
+      } else if (trimmed == "PAIRS") {
+        current_section = PAIRS;
+        continue;
       }
       
-      // Ensure tag1 < tag2 for consistent lookup
-      if (tag1 > tag2) std::swap(tag1, tag2);
-      
-      if (btype <= 0) {
-        error->one(FLERR,fmt::format("Invalid bond type {} in complementarity file at line {}", 
-                                     btype, line_num));
+      // Parse based on current section
+      if (current_section == TYPES) {
+        std::istringstream iss(line);
+        int btype;
+        double energy;
+        
+        if (!(iss >> btype >> energy)) {
+          error->one(FLERR,fmt::format("Invalid TYPES format in '{}' at line {}", 
+                                       complementarity_file, line_num));
+        }
+        
+        if (btype <= 0) {
+          error->one(FLERR,fmt::format("Invalid bond type {} in '{}' at line {}", 
+                                       btype, complementarity_file, line_num));
+        }
+        
+        // Store energy level and bond type
+        energy_levels.push_back(std::make_pair(energy, btype));
+        
+      } else if (current_section == PAIRS) {
+        std::istringstream iss(line);
+        tagint tag1, tag2;
+        double energy;
+        
+        if (!(iss >> tag1 >> tag2 >> energy)) {
+          error->one(FLERR,fmt::format("Invalid PAIRS format in '{}' at line {}", 
+                                       complementarity_file, line_num));
+        }
+        
+        // Ensure tag1 < tag2 for consistent lookup
+        if (tag1 > tag2) std::swap(tag1, tag2);
+        
+        // Store energy depth in map
+        complementarity_map[std::make_pair(tag1, tag2)] = energy;
+        
+      } else {
+        error->one(FLERR,fmt::format("Line {} in '{}' appears before any section header", 
+                                     line_num, complementarity_file));
       }
-      
-      // Store in map
-      complementarity_map[std::make_pair(tag1, tag2)] = btype;
     }
     
     file.close();
     
+    if (energy_levels.empty()) {
+      error->one(FLERR,fmt::format("No bond types defined in TYPES section of '{}'", 
+                                   complementarity_file));
+    }
+    
     if (complementarity_map.empty()) {
-      error->warning(FLERR,"Complementarity file '{}' contains no valid pairs", complementarity_file);
+      error->warning(FLERR,"Complementarity file '{}' contains no valid pairs", 
+                     complementarity_file);
+    }
+    
+    // Sort energy levels by energy (descending) for efficient lookup
+    std::sort(energy_levels.begin(), energy_levels.end(), 
+              [](const std::pair<double,int> &a, const std::pair<double,int> &b) {
+                return a.first > b.first;  // Descending order
+              });
+  }
+  
+  // Broadcast energy levels
+  int num_levels = energy_levels.size();
+  MPI_Bcast(&num_levels, 1, MPI_INT, 0, world);
+  
+  if (num_levels > 0) {
+    if (me != 0) energy_levels.resize(num_levels);
+    
+    // Prepare arrays for broadcast
+    std::vector<double> energies(num_levels);
+    std::vector<int> btypes(num_levels);
+    
+    if (me == 0) {
+      for (int i = 0; i < num_levels; i++) {
+        energies[i] = energy_levels[i].first;
+        btypes[i] = energy_levels[i].second;
+      }
+    }
+    
+    MPI_Bcast(energies.data(), num_levels, MPI_DOUBLE, 0, world);
+    MPI_Bcast(btypes.data(), num_levels, MPI_INT, 0, world);
+    
+    if (me != 0) {
+      for (int i = 0; i < num_levels; i++) {
+        energy_levels[i] = std::make_pair(energies[i], btypes[i]);
+      }
     }
   }
   
-  // Broadcast map size
+  // Broadcast complementarity map size
   int map_size = complementarity_map.size();
   MPI_Bcast(&map_size, 1, MPI_INT, 0, world);
   
@@ -185,36 +265,36 @@ void FixDnafoldBondHyb::read_complementarity_file()
   if (map_size > 0) {
     std::vector<tagint> tags1(map_size);
     std::vector<tagint> tags2(map_size);
-    std::vector<int> btypes(map_size);
+    std::vector<double> energies(map_size);
     
     if (me == 0) {
       int idx = 0;
       for (const auto &entry : complementarity_map) {
         tags1[idx] = entry.first.first;
         tags2[idx] = entry.first.second;
-        btypes[idx] = entry.second;
+        energies[idx] = entry.second;
         idx++;
       }
     }
     
     MPI_Bcast(tags1.data(), map_size, MPI_LMP_TAGINT, 0, world);
     MPI_Bcast(tags2.data(), map_size, MPI_LMP_TAGINT, 0, world);
-    MPI_Bcast(btypes.data(), map_size, MPI_INT, 0, world);
+    MPI_Bcast(energies.data(), map_size, MPI_DOUBLE, 0, world);
     
     if (me != 0) {
       for (int i = 0; i < map_size; i++) {
-        complementarity_map[std::make_pair(tags1[i], tags2[i])] = btypes[i];
+        complementarity_map[std::make_pair(tags1[i], tags2[i])] = energies[i];
       }
     }
   }
   
   if (me == 0) {
     if (screen) 
-      fprintf(screen,"Fix dnafold/bond/hyb: Read %d complementarity pairs from '%s'\n",
-              map_size, complementarity_file);
+      fprintf(screen,"Fix dnafold/bond/hyb: Read %d bond types and %d complementarity pairs from '%s'\n",
+              num_levels, map_size, complementarity_file);
     if (logfile) 
-      fprintf(logfile,"Fix dnafold/bond/hyb: Read %d complementarity pairs from '%s'\n",
-              map_size, complementarity_file);
+      fprintf(logfile,"Fix dnafold/bond/hyb: Read %d bond types and %d complementarity pairs from '%s'\n",
+              num_levels, map_size, complementarity_file);
   }
 }
 
@@ -225,10 +305,31 @@ int FixDnafoldBondHyb::get_bond_type(tagint tag_i, tagint tag_j)
   tagint tag2 = (tag_i < tag_j) ? tag_j : tag_i;
   
   auto it = complementarity_map.find(std::make_pair(tag1, tag2));
-  if (it != complementarity_map.end()) {
-    return it->second;  // Return bond type
+  if (it == complementarity_map.end()) {
+    return 0;  // Not complementary
   }
-  return 0;  // Not complementary
+  
+  double target_energy = it->second;
+  
+  // Find closest bond type by energy
+  // If target_energy < lowest available energy, return 0 (no bond)
+  if (target_energy < energy_levels.back().first) {
+    return 0;  // Energy too low, don't create bond
+  }
+  
+  // Find closest energy level
+  int best_btype = energy_levels[0].second;
+  double best_diff = fabs(target_energy - energy_levels[0].first);
+  
+  for (size_t i = 1; i < energy_levels.size(); i++) {
+    double diff = fabs(target_energy - energy_levels[i].first);
+    if (diff < best_diff) {
+      best_diff = diff;
+      best_btype = energy_levels[i].second;
+    }
+  }
+  
+  return best_btype;
 }
 
 void FixDnafoldBondHyb::post_integrate()
@@ -240,8 +341,8 @@ void FixDnafoldBondHyb::post_integrate()
 
   if (update->ntimestep % nevery) return;
 
-  double *hyb_status = atom->dvector[property_flag_index];
-  double *size = atom->dvector[size_index];
+  int *hyb_status = atom->ivector[property_flag_index];
+  int *size = atom->ivector[size_index];
   
   // Acquire updated ghost atom positions and properties
   // This ensures ghosts have current coordinates and custom properties
@@ -289,7 +390,7 @@ void FixDnafoldBondHyb::post_integrate()
     if (itype != iatomtype && itype != jatomtype) continue;
     
     // Only check atoms with hyb_status > 0 (have hybridized bonds)
-    if (hyb_status[i] <= EPSILON) continue;
+    if (hyb_status[i] == 0) continue;
     
     itag = tag[i];
     xtmp = x[i][0];
@@ -312,21 +413,9 @@ void FixDnafoldBondHyb::post_integrate()
       // This is a hyb bond - check distance
       j = atom->map(jtag);
       if (j < 0) {
-        // Partner not found - downgrade to dummy
-        bond_type[i][ib] = dummy_btype;
-        
-        // Calculate min_size - need to get j's size somehow, but j not found
-        // Best we can do is subtract size[i] (assumes worst case)
-        hyb_status[i] -= size[i];
-        
-        // If i is type 1, mark for angle removal
-        if (itype == iatomtype) {
-          downgraded_type1_tags.push_back(itag);
-        }
-        
-        downgradecount++;
-        ib++;
-        continue;
+        // Partner not found - this indicates ghost cutoff is too small
+        error->one(FLERR,"Fix dnafold/bond/hyb: Bonded atom not found in ghost atoms. "
+                         "Increase communication cutoff with 'comm_modify cutoff'");
       }
       
       // Check distance with minimum image convention
@@ -352,7 +441,7 @@ void FixDnafoldBondHyb::post_integrate()
         bond_type[i][ib] = dummy_btype;
         
         // Calculate min_size and subtract from hyb_status for both atoms
-        double min_size = (size[i] < size[j]) ? size[i] : size[j];
+        int min_size = (size[i] < size[j]) ? size[i] : size[j];
         hyb_status[i] -= min_size;
         
         // Also update j's hyb_status if j is local
@@ -442,8 +531,8 @@ void FixDnafoldBondHyb::post_integrate()
     
     if (!(mask[i] & groupbit)) continue;
     
-    // Skip if atom i already at full capacity
-    if (hyb_status[i] >= 1.0 - EPSILON) continue;
+    // Skip if atom i already at full capacity (hyb_status >= 2)
+    if (hyb_status[i] >= 2) continue;
     
     // Atom i must be type 1 or type 2
     itype = type[i];
@@ -467,8 +556,8 @@ void FixDnafoldBondHyb::post_integrate()
       
       if (!(mask[j] & groupbit)) continue;
       
-      // Skip if atom j already at full capacity
-      if (hyb_status[j] >= 1.0 - EPSILON) continue;
+      // Skip if atom j already at full capacity (hyb_status >= 2)
+      if (hyb_status[j] >= 2) continue;
 
       // Atom j must be the opposite type from i
       jtype = type[j];
@@ -499,9 +588,9 @@ void FixDnafoldBondHyb::post_integrate()
       if (btype_ij == 0) continue;  // Not complementary (shouldn't happen if dummy bond exists)
 
       // Check capacity constraint
-      double min_size = (size[i] < size[j]) ? size[i] : size[j];
-      if (hyb_status[i] + min_size > 1.0 + EPSILON) continue;
-      if (hyb_status[j] + min_size > 1.0 + EPSILON) continue;
+      int min_size = (size[i] < size[j]) ? size[i] : size[j];
+      if (hyb_status[i] + min_size > 2) continue;
+      if (hyb_status[j] + min_size > 2) continue;
 
       // Update partner for atom i if this is closer
       if (rsq < distsq[i]) {
@@ -562,7 +651,7 @@ void FixDnafoldBondHyb::post_integrate()
     remove_dummy_bond(i, j);
 
     // Calculate min_size and add to hyb_status for both atoms
-    double min_size = (size[i] < size[j]) ? size[i] : size[j];
+    int min_size = (size[i] < size[j]) ? size[i] : size[j];
     hyb_status[i] += min_size;
     
     // Also update j's hyb_status
