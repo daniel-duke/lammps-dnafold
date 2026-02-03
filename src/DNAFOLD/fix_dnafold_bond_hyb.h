@@ -74,10 +74,12 @@ class FixDnafoldBondHyb : public Fix {
   tagint *finalpartner;          // final partner after communication
   int *partnerbtype;             // bond type for the partner
   double *distsq;                // distance squared with partner
+  double *partner_energy;        // energy_depth of partner bond
   int commflag;                  // flag for communication mode
 
   void read_complementarity_file();  // read complementarity pairs from file
   int get_bond_type(tagint, tagint); // get bond type for a pair (returns 0 if not complementary)
+  double get_energy_depth(tagint, tagint); // get energy_depth for a pair (returns BIG if not complementary)
   void remove_dummy_bond(int, int);  // remove dummy bond between two atoms
 };
 
@@ -85,4 +87,5 @@ class FixDnafoldBondHyb : public Fix {
 
 #endif
 #endif
+
 

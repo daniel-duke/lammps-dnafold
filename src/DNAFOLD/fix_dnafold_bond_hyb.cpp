@@ -40,7 +40,7 @@ static constexpr double BIG = 1.0e20;
 
 FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), complementarity_file(nullptr),
-  partner(nullptr), finalpartner(nullptr), partnerbtype(nullptr), distsq(nullptr)
+  partner(nullptr), finalpartner(nullptr), partnerbtype(nullptr), distsq(nullptr), partner_energy(nullptr)
 {
   if (narg != 7) error->all(FLERR,"Illegal fix dnafold/bond/hyb command");
 
@@ -57,8 +57,8 @@ FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
   global_freq = 1;
   extvector = 0;
   
-  comm_forward = 3;  // partner tag, bond type, and distance squared
-  comm_reverse = 3;  // partner tag, bond type, and distance squared
+  comm_forward = 4;  // partner tag, bond type, distance squared, and energy_depth
+  comm_reverse = 4;  // partner tag, bond type, distance squared, and energy_depth
 
   // Bonds form between type 1 and type 2 atoms only
   iatomtype = 1;
@@ -91,6 +91,7 @@ FixDnafoldBondHyb::~FixDnafoldBondHyb()
   memory->destroy(finalpartner);
   memory->destroy(partnerbtype);
   memory->destroy(distsq);
+  memory->destroy(partner_energy);
 }
 
 int FixDnafoldBondHyb::setmask()
@@ -332,6 +333,20 @@ int FixDnafoldBondHyb::get_bond_type(tagint tag_i, tagint tag_j)
   return best_btype;
 }
 
+double FixDnafoldBondHyb::get_energy_depth(tagint tag_i, tagint tag_j)
+{
+  // Ensure tag1 < tag2 for consistent lookup
+  tagint tag1 = (tag_i < tag_j) ? tag_i : tag_j;
+  tagint tag2 = (tag_i < tag_j) ? tag_j : tag_i;
+  
+  auto it = complementarity_map.find(std::make_pair(tag1, tag2));
+  if (it == complementarity_map.end()) {
+    return BIG;  // Not complementary, return very large value
+  }
+  
+  return it->second;  // Return energy_depth
+}
+
 void FixDnafoldBondHyb::post_integrate()
 {
   int i,j,m;
@@ -354,11 +369,13 @@ void FixDnafoldBondHyb::post_integrate()
     memory->destroy(finalpartner);
     memory->destroy(partnerbtype);
     memory->destroy(distsq);
+    memory->destroy(partner_energy);
     nmax = atom->nmax;
     memory->create(partner, nmax, "dnafold/bond/hyb:partner");
     memory->create(finalpartner, nmax, "dnafold/bond/hyb:finalpartner");
     memory->create(partnerbtype, nmax, "dnafold/bond/hyb:partnerbtype");
     memory->create(distsq, nmax, "dnafold/bond/hyb:distsq");
+    memory->create(partner_energy, nmax, "dnafold/bond/hyb:partner_energy");
   }
 
   int nlocal = atom->nlocal;
@@ -377,6 +394,7 @@ void FixDnafoldBondHyb::post_integrate()
     finalpartner[i] = 0;
     partnerbtype[i] = 0;
     distsq[i] = BIG;
+    partner_energy[i] = BIG;
   }
 
   // First pass: downgrade hyb bonds that are too far apart back to dummy bonds
@@ -583,28 +601,37 @@ void FixDnafoldBondHyb::post_integrate()
       rsq = delx*delx + dely*dely + delz*delz;
       if (rsq > cutoffsq) continue;
 
-      // Check if this pair is complementary and get bond type
+      // Check if this pair is complementary and get bond type and energy
       btype_ij = get_bond_type(itag, jtag);
       if (btype_ij == 0) continue;  // Not complementary (shouldn't happen if dummy bond exists)
+      
+      double energy_ij = get_energy_depth(itag, jtag);
 
       // Check capacity constraint
       int min_size = (size[i] < size[j]) ? size[i] : size[j];
       if (hyb_status[i] + min_size > 2) continue;
       if (hyb_status[j] + min_size > 2) continue;
 
-      // Update partner for atom i if this is closer
-      if (rsq < distsq[i]) {
+      // Update partner for atom i if this is better
+      // Better = lower energy_depth (stronger bond), or same energy but closer distance
+      bool better_for_i = (energy_ij < partner_energy[i]) || 
+                          (energy_ij == partner_energy[i] && rsq < distsq[i]);
+      if (better_for_i) {
         partner[i] = jtag;
         partnerbtype[i] = btype_ij;
         distsq[i] = rsq;
+        partner_energy[i] = energy_ij;
       }
       
-      // Update partner for atom j if this is closer
+      // Update partner for atom j if this is better
       // This is safe even if j is a ghost - we'll communicate this back
-      if (rsq < distsq[j]) {
+      bool better_for_j = (energy_ij < partner_energy[j]) || 
+                          (energy_ij == partner_energy[j] && rsq < distsq[j]);
+      if (better_for_j) {
         partner[j] = itag;
         partnerbtype[j] = btype_ij;
         distsq[j] = rsq;
+        partner_energy[j] = energy_ij;
       }
     }
   }
@@ -694,6 +721,7 @@ int FixDnafoldBondHyb::pack_forward_comm(int n, int *list, double *buf,
     buf[m++] = ubuf(partner[j]).d;
     buf[m++] = ubuf(partnerbtype[j]).d;
     buf[m++] = distsq[j];
+    buf[m++] = partner_energy[j];
   }
   return m;
 }
@@ -708,6 +736,7 @@ void FixDnafoldBondHyb::unpack_forward_comm(int n, int first, double *buf)
     partner[i] = (tagint) ubuf(buf[m++]).i;
     partnerbtype[i] = (int) ubuf(buf[m++]).i;
     distsq[i] = buf[m++];
+    partner_energy[i] = buf[m++];
   }
 }
 
@@ -721,6 +750,7 @@ int FixDnafoldBondHyb::pack_reverse_comm(int n, int first, double *buf)
     buf[m++] = ubuf(partner[i]).d;
     buf[m++] = ubuf(partnerbtype[i]).d;
     buf[m++] = distsq[i];
+    buf[m++] = partner_energy[i];
   }
   return m;
 }
@@ -732,12 +762,19 @@ void FixDnafoldBondHyb::unpack_reverse_comm(int n, int *list, double *buf)
   m = 0;
   for (i = 0; i < n; i++) {
     j = list[i];
-    // Keep the closer partner (smaller distance)
-    if (buf[m+2] < distsq[j]) {
+    // Keep the better partner: lower energy_depth (stronger bond), or same energy but closer distance
+    double incoming_energy = buf[m+3];
+    double incoming_distsq = buf[m+2];
+    
+    bool better = (incoming_energy < partner_energy[j]) || 
+                  (incoming_energy == partner_energy[j] && incoming_distsq < distsq[j]);
+    
+    if (better) {
       partner[j] = (tagint) ubuf(buf[m++]).i;
       partnerbtype[j] = (int) ubuf(buf[m++]).i;
       distsq[j] = buf[m++];
-    } else m += 3;
+      partner_energy[j] = buf[m++];
+    } else m += 4;
   }
 }
 
@@ -774,11 +811,12 @@ double FixDnafoldBondHyb::memory_usage()
 {
   double bytes = (double)nmax * 2 * sizeof(tagint);  // partner, finalpartner
   bytes += (double)nmax * sizeof(int);                // partnerbtype
-  bytes += (double)nmax * sizeof(double);             // distsq
+  bytes += (double)nmax * 2 * sizeof(double);         // distsq, partner_energy
   
   // Estimate map memory (rough approximation)
   bytes += complementarity_map.size() * (2 * sizeof(tagint) + sizeof(int) + 32);
   
   return bytes;
 }
+
 
