@@ -326,6 +326,14 @@ void FixDnafoldBondPre::post_integrate()
         continue;  // Don't increment k since we shifted
       }
       
+      // Check that atoms are opposite types
+      jtype = type[j];
+      if (!((itype == iatomtype && jtype == jatomtype) || 
+            (itype == jatomtype && jtype == iatomtype))) {
+        k++;
+        continue;
+      }
+      
       // Check distance with minimum image convention
       delx = x[i][0] - x[j][0];
       dely = x[i][1] - x[j][1];

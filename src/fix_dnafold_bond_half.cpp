@@ -43,12 +43,12 @@ FixDnafoldBondHalf::FixDnafoldBondHalf(LAMMPS *lmp, int narg, char **arg) :
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
   if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half nevery");
 
-  bond_type = utils::inumeric(FLERR,arg[4],false,lmp);
-  if (bond_type <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half bond_type");
-
-  double cutoff = utils::numeric(FLERR,arg[5],false,lmp);
+  double cutoff = utils::numeric(FLERR,arg[4],false,lmp);
   if (cutoff <= 0.0) error->all(FLERR,"Illegal fix dnafold/bond/half cutoff");
   cutoff_sq = cutoff * cutoff;
+
+  bond_type = utils::inumeric(FLERR,arg[5],false,lmp);
+  if (bond_type <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half bond_type");
 
   type1 = 1;
   type2 = 2;
@@ -189,6 +189,7 @@ void FixDnafoldBondHalf::create_same_type_bonds()
   tagint **bond_atom = atom->bond_atom;
   int **bond_type_arr = atom->bond_type;
   int *size = atom->ivector[size_index];
+  double **x = atom->x;
 
   // Loop over local atoms as central atoms
   for (int i = 0; i < nlocal; i++) {
@@ -234,6 +235,27 @@ void FixDnafoldBondHalf::create_same_type_bonds()
         // Check if they're already bonded to each other
         if (atoms_bonded(j, k)) continue;
         
+        // Check distance between j and k (with minimum image)
+        double delx = x[j][0] - x[k][0];
+        double dely = x[j][1] - x[k][1];
+        double delz = x[j][2] - x[k][2];
+        
+        if (domain->xperiodic) {
+          if (delx > domain->xprd_half) delx -= domain->xprd;
+          else if (delx < -domain->xprd_half) delx += domain->xprd;
+        }
+        if (domain->yperiodic) {
+          if (dely > domain->yprd_half) dely -= domain->yprd;
+          else if (dely < -domain->yprd_half) dely += domain->yprd;
+        }
+        if (domain->zperiodic) {
+          if (delz > domain->zprd_half) delz -= domain->zprd;
+          else if (delz < -domain->zprd_half) delz += domain->zprd;
+        }
+        
+        double rsq = delx*delx + dely*dely + delz*delz;
+        if (rsq > cutoff_sq) continue;
+        
         // Determine which is lower tagged
         tagint lower_tag = (jtag < ktag) ? jtag : ktag;
         tagint higher_tag = (jtag < ktag) ? ktag : jtag;
@@ -274,6 +296,8 @@ void FixDnafoldBondHalf::break_stretched_bonds()
   int *num_bond = atom->num_bond;
   int **bond_type_arr = atom->bond_type;
   tagint **bond_atom = atom->bond_atom;
+  int *type = atom->type;
+  int *size = atom->ivector[size_index];
   
   for (int i = 0; i < nlocal; i++) {
     int k = 0;
@@ -283,12 +307,27 @@ void FixDnafoldBondHalf::break_stretched_bonds()
         continue;
       }
       
-      // Check distance
+      // Atom i must be a half-bead (size == 1)
+      if (size[i] != 1) {
+        k++;
+        continue;
+      }
+      
+      // Find the partner atom
       tagint j_tag = bond_atom[i][k];
       int j = atom->map(j_tag);
       
       if (j < 0) {
-        // Partner not on this processor - skip
+        // Partner atom not found - remove bond
+        num_bond[i]--;
+        bond_atom[i][k] = bond_atom[i][num_bond[i]];
+        bond_type_arr[i][k] = bond_type_arr[i][num_bond[i]];
+        breakcount++;
+        continue;  // Don't increment k since we shifted
+      }
+      
+      // Partner must also be a half-bead (size == 1) and same type as i
+      if (size[j] != 1 || type[j] != type[i]) {
         k++;
         continue;
       }

@@ -78,7 +78,6 @@ class FixDnafoldBondHyb : public Fix {
 
   void read_complementarity_file();  // read complementarity pairs from file
   int get_bond_type(tagint, tagint); // get bond type for a pair (returns 0 if not complementary)
-  int bond_exists(int, int);         // check if bond exists between two atoms
   void remove_dummy_bond(int, int);  // remove dummy bond between two atoms
 };
 

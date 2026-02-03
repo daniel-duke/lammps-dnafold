@@ -683,36 +683,6 @@ void FixDnafoldBondHyb::post_integrate()
   }
 }
 
-int FixDnafoldBondHyb::bond_exists(int i, int j)
-{
-  int **nspecial = atom->nspecial;
-  tagint **special = atom->special;
-  tagint jtag = atom->tag[j];
-  int **bond_type = atom->bond_type;
-  tagint **bond_atom = atom->bond_atom;
-  int *num_bond = atom->num_bond;
-
-  // Check if j is in i's 1-2 neighbor list (special bonds)
-  // Ignore dummy bonds - they don't count as existing bonds
-  for (int k = 0; k < nspecial[i][0]; k++) {
-    if (special[i][k] == jtag) {
-      // Found in special list, but check if it's a dummy bond
-      // Look through i's bonds to find the bond to j
-      for (int m = 0; m < num_bond[i]; m++) {
-        if (bond_atom[i][m] == jtag) {
-          if (bond_type[i][m] == dummy_btype) {
-            return 0;  // It's a dummy bond, doesn't count
-          }
-          return 1;  // It's a real bond
-        }
-      }
-      // In special list but bond not found in num_bond - shouldn't happen
-      return 1;
-    }
-  }
-  return 0;
-}
-
 int FixDnafoldBondHyb::pack_forward_comm(int n, int *list, double *buf, 
                                           int /* pbc_flag */, int * /* pbc */)
 {
