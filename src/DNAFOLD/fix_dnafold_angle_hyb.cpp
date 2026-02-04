@@ -27,6 +27,7 @@
 #include "input.h"
 #include "memory.h"
 #include "modify.h"
+#include "special.h"
 #include "update.h"
 #include "variable.h"
 
@@ -130,6 +131,23 @@ void FixDnafoldAngleHyb::post_integrate()
   MPI_Allreduce(&createcount,&createcountall,1,MPI_INT,MPI_SUM,world);
   createcounttotal += createcountall;
   createcount = createcountall;
+
+  // If any angles were created, rebuild special lists
+  // (angles affect 1-3 special interactions)
+  if (createcount > 0) {
+    // Suppress output from Special::build()
+    FILE *screen_save = screen;
+    FILE *logfile_save = logfile;
+    screen = nullptr;
+    logfile = nullptr;
+
+    Special special(lmp);
+    special.build();
+
+    // Restore output
+    screen = screen_save;
+    logfile = logfile_save;
+  }
 }
 
 /* ---------------------------------------------------------------------- */

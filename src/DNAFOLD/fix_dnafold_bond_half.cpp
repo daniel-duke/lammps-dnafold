@@ -20,8 +20,8 @@
 #include "force.h"
 #include "memory.h"
 #include "modify.h"
-#include "update.h"
 #include "special.h"
+#include "update.h"
 
 #include <cmath>
 #include <cstring>
@@ -160,16 +160,27 @@ void FixDnafoldBondHalf::post_integrate()
 
   // If any bonds were created or removed, rebuild special lists and trigger reneighboring
   if (createcount > 0 || breakcount > 0) {
-    next_reneighbor = update->ntimestep;
+    // Suppress output from Special::build()
+    FILE *screen_save = screen;
+    FILE *logfile_save = logfile;
+    screen = nullptr;
+    logfile = nullptr;
+
     Special special(lmp);
     special.build();
-    
+
+    // Restore output
+    screen = screen_save;
+    logfile = logfile_save;
+
+    next_reneighbor = update->ntimestep;
+
     if (me == 0) {
-      if (screen) 
-        fprintf(screen,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
+      if (screen_save)
+        fprintf(screen_save,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
                 createcount, breakcount, update->ntimestep);
-      if (logfile) 
-        fprintf(logfile,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
+      if (logfile_save)
+        fprintf(logfile_save,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
                 createcount, breakcount, update->ntimestep);
     }
   }

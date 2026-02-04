@@ -60,13 +60,21 @@ class FixDnafoldBondHyb : public Fix {
   bigint createcounttotal;       // cumulative bonds created
   bigint downgradecounttotal;    // cumulative bonds downgraded
 
-  // Complementarity map: (tag1, tag2) -> energy_depth
+  // Temperature-dependent complementarity data
+  std::vector<double> temperatures;     // list of temperatures from file
+  int num_temperatures;                  // number of temperature points
+
+  // Complementarity map: (tag1, tag2) -> vector of energies at each temperature
   // tag1 < tag2 always
-  std::unordered_map<std::pair<tagint, tagint>, double, PairHash> complementarity_map;
-  
+  std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHash> complementarity_map;
+
   // Energy levels: sorted pairs of (energy_depth, bond_type)
-  // Sorted in descending order by energy_depth
+  // Sorted in descending order by energy_depth (highest energy = strongest bond)
   std::vector<std::pair<double, int>> energy_levels;
+
+  // Temperature variable access
+  char *tvar;                            // name of temperature variable (without v_ prefix)
+  int tvar_index;                        // index of temperature variable
 
   // Arrays for partner selection across processors
   int nmax;                      // size of per-atom arrays
@@ -77,10 +85,11 @@ class FixDnafoldBondHyb : public Fix {
   double *partner_energy;        // energy_depth of partner bond
   int commflag;                  // flag for communication mode
 
-  void read_complementarity_file();  // read complementarity pairs from file
-  int get_bond_type(tagint, tagint); // get bond type for a pair (returns 0 if not complementary)
+  void read_complementarity_file();     // read complementarity pairs from file
+  double get_interpolated_energy(tagint, tagint); // get energy at current temperature
+  int get_bond_type(tagint, tagint);    // get bond type for a pair (returns 0 if not complementary)
   double get_energy_depth(tagint, tagint); // get energy_depth for a pair (returns BIG if not complementary)
-  void remove_dummy_bond(int, int);  // remove dummy bond between two atoms
+  void remove_dummy_bond(int, int);     // remove dummy bond between two atoms
 };
 
 }    // namespace LAMMPS_NS

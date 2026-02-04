@@ -22,7 +22,7 @@ FixStyle(dnafold/bond/pre,FixDnafoldBondPre);
 
 #include "fix.h"
 #include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 namespace LAMMPS_NS {
 
@@ -60,12 +60,23 @@ class FixDnafoldBondPre : public Fix {
 
   class NeighList *list;         // neighbor list
 
-  // Set of complementary pairs: only stores if pair exists, not bond type
-  std::unordered_set<std::pair<tagint, tagint>, PairHashPre> complementarity_set;
+  // Temperature-dependent complementarity data
+  std::vector<double> temperatures;     // list of temperatures from file
+  int num_temperatures;                  // number of temperature points
+  double min_energy_threshold;           // minimum energy for bond formation (from TYPES)
 
-  void read_complementarity_file();     // read complementarity pairs from file
-  bool is_complementary(tagint, tagint); // check if pair is complementary
-  bool dummy_bond_exists(int, int);     // check if dummy bond exists between two atoms
+  // Map of complementary pairs: (tag1, tag2) -> vector of energies at each temperature
+  std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHashPre> complementarity_map;
+
+  // Temperature variable access
+  char *tvar;                            // name of temperature variable (without v_ prefix)
+  int tvar_index;                        // index of temperature variable
+
+  void read_complementarity_file();      // read complementarity pairs from file
+  double get_interpolated_energy(tagint, tagint); // get energy at current temperature
+  bool is_complementary(tagint, tagint); // check if pair is complementary at current T
+  bool dummy_bond_exists(int, int);      // check if dummy bond exists between two atoms
+  bool any_bond_exists(int, int);        // check if any bond exists between two atoms
 };
 
 }    // namespace LAMMPS_NS

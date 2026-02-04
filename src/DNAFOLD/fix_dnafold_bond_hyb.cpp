@@ -14,19 +14,22 @@
 #include "fix_dnafold_bond_hyb.h"
 
 #include "atom.h"
+#include "special.h"
 #include "comm.h"
 #include "domain.h"
 #include "error.h"
 #include "force.h"
 #include "group.h"
+#include "input.h"
 #include "memory.h"
 #include "modify.h"
 #include "neighbor.h"
 #include "neigh_list.h"
 #include "neigh_request.h"
 #include "update.h"
-#include "special.h"
+#include "variable.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -39,10 +42,10 @@ using namespace FixConst;
 static constexpr double BIG = 1.0e20;
 
 FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
-  Fix(lmp, narg, arg), complementarity_file(nullptr),
+  Fix(lmp, narg, arg), complementarity_file(nullptr), tvar(nullptr),
   partner(nullptr), finalpartner(nullptr), partnerbtype(nullptr), distsq(nullptr), partner_energy(nullptr)
 {
-  if (narg != 7) error->all(FLERR,"Illegal fix dnafold/bond/hyb command");
+  if (narg != 8) error->all(FLERR,"Illegal fix dnafold/bond/hyb command");
 
   MPI_Comm_rank(world,&me);
   MPI_Comm_size(world,&nprocs);
@@ -73,13 +76,20 @@ FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
 
   complementarity_file = utils::strdup(arg[6]);
 
+  // Parse temperature variable (must start with v_)
+  if (strncmp(arg[7], "v_", 2) != 0)
+    error->all(FLERR,"Temperature variable for fix dnafold/bond/hyb must start with v_");
+  tvar = utils::strdup(arg[7] + 2);  // skip "v_" prefix
+  tvar_index = -1;  // will be set in init()
+
   createcount = 0;
   downgradecount = 0;
   createcounttotal = 0;
   downgradecounttotal = 0;
-  
+
   nmax = 0;
-  
+  num_temperatures = 0;
+
   // Read complementarity file - only rank 0 reads, then broadcasts
   read_complementarity_file();
 }
@@ -87,6 +97,7 @@ FixDnafoldBondHyb::FixDnafoldBondHyb(LAMMPS *lmp, int narg, char **arg) :
 FixDnafoldBondHyb::~FixDnafoldBondHyb()
 {
   delete[] complementarity_file;
+  delete[] tvar;
   memory->destroy(partner);
   memory->destroy(finalpartner);
   memory->destroy(partnerbtype);
@@ -119,9 +130,16 @@ void FixDnafoldBondHyb::init()
   if (flag_size != 0)
     error->all(FLERR,fmt::format("Property 'i_size' must be integer"));
 
+  // Find and validate temperature variable
+  tvar_index = input->variable->find(tvar);
+  if (tvar_index < 0)
+    error->all(FLERR,"Variable {} for fix dnafold/bond/hyb does not exist", tvar);
+  if (!input->variable->equalstyle(tvar_index))
+    error->all(FLERR,"Variable {} for fix dnafold/bond/hyb must be equal-style", tvar);
+
   if (atom->molecular != Atom::MOLECULAR)
     error->all(FLERR,"Cannot use fix dnafold/bond/hyb with non-molecular system");
-  
+
   if (force->bond == nullptr)
     error->all(FLERR,"Must define bond_style");
 
@@ -139,189 +157,275 @@ void FixDnafoldBondHyb::read_complementarity_file()
   // Only rank 0 reads the file
   if (me == 0) {
     std::ifstream file(complementarity_file);
-    if (!file.is_open()) 
+    if (!file.is_open())
       error->one(FLERR,fmt::format("Cannot open complementarity file '{}'", complementarity_file));
-    
+
     std::string line;
     int line_num = 0;
-    enum Section { NONE, TYPES, PAIRS };
+    enum Section { NONE, TEMPERATURES, TYPES, PAIRS };
     Section current_section = NONE;
-    
+
     while (std::getline(file, line)) {
       line_num++;
-      
+
       // Skip empty lines
       if (line.empty()) continue;
-      
+
       // Skip comment lines (lines starting with #)
       if (line[0] == '#') continue;
-      
+
       // Trim leading whitespace for section detection
       size_t start = line.find_first_not_of(" \t");
       if (start == std::string::npos) continue;  // All whitespace
       std::string trimmed = line.substr(start);
-      
+
       // Check for section headers
-      if (trimmed == "TYPES") {
+      if (trimmed == "TEMPERATURES") {
+        current_section = TEMPERATURES;
+        continue;
+      } else if (trimmed == "TYPES") {
         current_section = TYPES;
         continue;
       } else if (trimmed == "PAIRS") {
         current_section = PAIRS;
+        if (temperatures.empty()) {
+          error->one(FLERR,fmt::format("TEMPERATURES section must appear before PAIRS in '{}'",
+                                       complementarity_file));
+        }
         continue;
       }
-      
-      // Parse based on current section
+
+      // Parse TEMPERATURES section
+      if (current_section == TEMPERATURES) {
+        std::istringstream iss(line);
+        double temp;
+        while (iss >> temp) {
+          temperatures.push_back(temp);
+        }
+        if (temperatures.empty()) {
+          error->one(FLERR,fmt::format("Invalid TEMPERATURES format in '{}' at line {}",
+                                       complementarity_file, line_num));
+        }
+        num_temperatures = temperatures.size();
+        continue;
+      }
+
+      // Parse TYPES section
       if (current_section == TYPES) {
         std::istringstream iss(line);
         int btype;
         double energy;
-        
+
         if (!(iss >> btype >> energy)) {
-          error->one(FLERR,fmt::format("Invalid TYPES format in '{}' at line {}", 
+          error->one(FLERR,fmt::format("Invalid TYPES format in '{}' at line {}",
                                        complementarity_file, line_num));
         }
-        
+
         if (btype <= 0) {
-          error->one(FLERR,fmt::format("Invalid bond type {} in '{}' at line {}", 
+          error->one(FLERR,fmt::format("Invalid bond type {} in '{}' at line {}",
                                        btype, complementarity_file, line_num));
         }
-        
+
         // Store energy level and bond type
         energy_levels.push_back(std::make_pair(energy, btype));
-        
-      } else if (current_section == PAIRS) {
+        continue;
+      }
+
+      // Parse PAIRS section
+      if (current_section == PAIRS) {
         std::istringstream iss(line);
         tagint tag1, tag2;
-        double energy;
-        
-        if (!(iss >> tag1 >> tag2 >> energy)) {
-          error->one(FLERR,fmt::format("Invalid PAIRS format in '{}' at line {}", 
+
+        if (!(iss >> tag1 >> tag2)) {
+          error->one(FLERR,fmt::format("Invalid PAIRS format in '{}' at line {}",
                                        complementarity_file, line_num));
         }
-        
+
+        // Read energy values for each temperature
+        std::vector<double> energies;
+        double energy;
+        while (iss >> energy) {
+          energies.push_back(energy);
+        }
+
+        if ((int)energies.size() != num_temperatures) {
+          error->one(FLERR,fmt::format("PAIRS line {} in '{}' has {} energies, expected {}",
+                                       line_num, complementarity_file,
+                                       energies.size(), num_temperatures));
+        }
+
         // Ensure tag1 < tag2 for consistent lookup
         if (tag1 > tag2) std::swap(tag1, tag2);
-        
-        // Store energy depth in map
-        complementarity_map[std::make_pair(tag1, tag2)] = energy;
-        
-      } else {
-        error->one(FLERR,fmt::format("Line {} in '{}' appears before any section header", 
+
+        // Store in map
+        complementarity_map[std::make_pair(tag1, tag2)] = energies;
+
+      } else if (current_section == NONE) {
+        error->one(FLERR,fmt::format("Line {} in '{}' appears before any section header",
                                      line_num, complementarity_file));
       }
     }
-    
+
     file.close();
-    
+
+    if (temperatures.empty()) {
+      error->one(FLERR,fmt::format("No TEMPERATURES section found in '{}'", complementarity_file));
+    }
+
     if (energy_levels.empty()) {
-      error->one(FLERR,fmt::format("No bond types defined in TYPES section of '{}'", 
+      error->one(FLERR,fmt::format("No bond types defined in TYPES section of '{}'",
                                    complementarity_file));
     }
-    
+
     if (complementarity_map.empty()) {
-      error->warning(FLERR,"Complementarity file '{}' contains no valid pairs", 
+      error->warning(FLERR,"Complementarity file '{}' contains no valid pairs",
                      complementarity_file);
     }
-    
+
     // Sort energy levels by energy (descending) for efficient lookup
-    std::sort(energy_levels.begin(), energy_levels.end(), 
+    // Higher energy = stronger bond
+    std::sort(energy_levels.begin(), energy_levels.end(),
               [](const std::pair<double,int> &a, const std::pair<double,int> &b) {
                 return a.first > b.first;  // Descending order
               });
   }
-  
+
+  // Broadcast num_temperatures and temperatures
+  MPI_Bcast(&num_temperatures, 1, MPI_INT, 0, world);
+
+  if (num_temperatures > 0) {
+    if (me != 0) temperatures.resize(num_temperatures);
+    MPI_Bcast(temperatures.data(), num_temperatures, MPI_DOUBLE, 0, world);
+  }
+
   // Broadcast energy levels
   int num_levels = energy_levels.size();
   MPI_Bcast(&num_levels, 1, MPI_INT, 0, world);
-  
+
   if (num_levels > 0) {
     if (me != 0) energy_levels.resize(num_levels);
-    
+
     // Prepare arrays for broadcast
-    std::vector<double> energies(num_levels);
+    std::vector<double> level_energies(num_levels);
     std::vector<int> btypes(num_levels);
-    
+
     if (me == 0) {
       for (int i = 0; i < num_levels; i++) {
-        energies[i] = energy_levels[i].first;
+        level_energies[i] = energy_levels[i].first;
         btypes[i] = energy_levels[i].second;
       }
     }
-    
-    MPI_Bcast(energies.data(), num_levels, MPI_DOUBLE, 0, world);
+
+    MPI_Bcast(level_energies.data(), num_levels, MPI_DOUBLE, 0, world);
     MPI_Bcast(btypes.data(), num_levels, MPI_INT, 0, world);
-    
+
     if (me != 0) {
       for (int i = 0; i < num_levels; i++) {
-        energy_levels[i] = std::make_pair(energies[i], btypes[i]);
+        energy_levels[i] = std::make_pair(level_energies[i], btypes[i]);
       }
     }
   }
-  
+
   // Broadcast complementarity map size
   int map_size = complementarity_map.size();
   MPI_Bcast(&map_size, 1, MPI_INT, 0, world);
-  
+
   // Broadcast map contents
   if (map_size > 0) {
     std::vector<tagint> tags1(map_size);
     std::vector<tagint> tags2(map_size);
-    std::vector<double> energies(map_size);
-    
+    std::vector<double> all_energies(map_size * num_temperatures);
+
     if (me == 0) {
       int idx = 0;
       for (const auto &entry : complementarity_map) {
         tags1[idx] = entry.first.first;
         tags2[idx] = entry.first.second;
-        energies[idx] = entry.second;
+        for (int t = 0; t < num_temperatures; t++) {
+          all_energies[idx * num_temperatures + t] = entry.second[t];
+        }
         idx++;
       }
     }
-    
+
     MPI_Bcast(tags1.data(), map_size, MPI_LMP_TAGINT, 0, world);
     MPI_Bcast(tags2.data(), map_size, MPI_LMP_TAGINT, 0, world);
-    MPI_Bcast(energies.data(), map_size, MPI_DOUBLE, 0, world);
-    
+    MPI_Bcast(all_energies.data(), map_size * num_temperatures, MPI_DOUBLE, 0, world);
+
     if (me != 0) {
       for (int i = 0; i < map_size; i++) {
-        complementarity_map[std::make_pair(tags1[i], tags2[i])] = energies[i];
+        std::vector<double> energies(num_temperatures);
+        for (int t = 0; t < num_temperatures; t++) {
+          energies[t] = all_energies[i * num_temperatures + t];
+        }
+        complementarity_map[std::make_pair(tags1[i], tags2[i])] = energies;
       }
     }
   }
-  
+
   if (me == 0) {
-    if (screen) 
-      fprintf(screen,"Fix dnafold/bond/hyb: Read %d bond types and %d complementarity pairs from '%s'\n",
-              num_levels, map_size, complementarity_file);
-    if (logfile) 
-      fprintf(logfile,"Fix dnafold/bond/hyb: Read %d bond types and %d complementarity pairs from '%s'\n",
-              num_levels, map_size, complementarity_file);
+    if (screen)
+      fprintf(screen,"Fix dnafold/bond/hyb: Read %d temperatures, %d bond types, and %d complementarity pairs from '%s'\n",
+              num_temperatures, num_levels, map_size, complementarity_file);
+    if (logfile)
+      fprintf(logfile,"Fix dnafold/bond/hyb: Read %d temperatures, %d bond types, and %d complementarity pairs from '%s'\n",
+              num_temperatures, num_levels, map_size, complementarity_file);
   }
 }
 
-int FixDnafoldBondHyb::get_bond_type(tagint tag_i, tagint tag_j)
+double FixDnafoldBondHyb::get_interpolated_energy(tagint tag_i, tagint tag_j)
 {
   // Ensure tag1 < tag2 for consistent lookup
   tagint tag1 = (tag_i < tag_j) ? tag_i : tag_j;
   tagint tag2 = (tag_i < tag_j) ? tag_j : tag_i;
-  
+
   auto it = complementarity_map.find(std::make_pair(tag1, tag2));
-  if (it == complementarity_map.end()) {
-    return 0;  // Not complementary
+  if (it == complementarity_map.end()) return -BIG;  // Not complementary
+
+  const std::vector<double>& energies = it->second;
+
+  // Get current temperature from variable
+  double T = input->variable->compute_equal(tvar_index);
+
+  // Check bounds - error if outside range
+  if (T < temperatures.front() || T > temperatures.back()) {
+    error->all(FLERR, fmt::format(
+      "Fix dnafold/bond/hyb: Temperature {} outside complementarity file range [{}, {}]",
+      T, temperatures.front(), temperatures.back()));
   }
-  
-  double target_energy = it->second;
-  
-  // Find closest bond type by energy
+
+  // Find bracketing temperatures and interpolate
+  for (int i = 0; i < num_temperatures - 1; i++) {
+    if (T >= temperatures[i] && T <= temperatures[i+1]) {
+      double t0 = temperatures[i];
+      double t1 = temperatures[i+1];
+      double e0 = energies[i];
+      double e1 = energies[i+1];
+      double frac = (T - t0) / (t1 - t0);
+      return e0 + frac * (e1 - e0);
+    }
+  }
+
+  return energies.back();  // Should not reach here, but return last value
+}
+
+int FixDnafoldBondHyb::get_bond_type(tagint tag_i, tagint tag_j)
+{
+  double target_energy = get_interpolated_energy(tag_i, tag_j);
+
+  // Not complementary
+  if (target_energy < -BIG/2) return 0;
+
   // If target_energy < lowest available energy, return 0 (no bond)
+  // energy_levels is sorted descending, so .back() is the lowest (weakest)
   if (target_energy < energy_levels.back().first) {
     return 0;  // Energy too low, don't create bond
   }
-  
+
   // Find closest energy level
   int best_btype = energy_levels[0].second;
   double best_diff = fabs(target_energy - energy_levels[0].first);
-  
+
   for (size_t i = 1; i < energy_levels.size(); i++) {
     double diff = fabs(target_energy - energy_levels[i].first);
     if (diff < best_diff) {
@@ -329,22 +433,18 @@ int FixDnafoldBondHyb::get_bond_type(tagint tag_i, tagint tag_j)
       best_btype = energy_levels[i].second;
     }
   }
-  
+
   return best_btype;
 }
 
 double FixDnafoldBondHyb::get_energy_depth(tagint tag_i, tagint tag_j)
 {
-  // Ensure tag1 < tag2 for consistent lookup
-  tagint tag1 = (tag_i < tag_j) ? tag_i : tag_j;
-  tagint tag2 = (tag_i < tag_j) ? tag_j : tag_i;
-  
-  auto it = complementarity_map.find(std::make_pair(tag1, tag2));
-  if (it == complementarity_map.end()) {
-    return BIG;  // Not complementary, return very large value
-  }
-  
-  return it->second;  // Return energy_depth
+  double energy = get_interpolated_energy(tag_i, tag_j);
+
+  // Not complementary - return very large value (for "worst" comparison)
+  if (energy < -BIG/2) return BIG;
+
+  return energy;
 }
 
 void FixDnafoldBondHyb::post_integrate()
@@ -397,45 +497,46 @@ void FixDnafoldBondHyb::post_integrate()
     partner_energy[i] = BIG;
   }
 
-  // First pass: downgrade hyb bonds that are too far apart back to dummy bonds
+  // First pass: check existing hyb bonds for distance and energy-based updates
+  // - If too far: downgrade to dummy
+  // - If energy dropped below threshold: downgrade to dummy
+  // - If energy changed to different bond type: update bond type
   int downgradecount = 0;
+  int updatecount = 0;
   std::vector<tagint> downgraded_type1_tags;  // Track type 1 atoms that were downgraded
-  
+
   for (i = 0; i < nlocal; i++) {
     if (!(mask[i] & groupbit)) continue;
-    
+
     itype = type[i];
     if (itype != iatomtype && itype != jatomtype) continue;
-    
+
     // Only check atoms with hyb_status > 0 (have hybridized bonds)
     if (hyb_status[i] == 0) continue;
-    
+
     itag = tag[i];
     xtmp = x[i][0];
     ytmp = x[i][1];
     ztmp = x[i][2];
-    
-    // Loop through i's bonds looking for hyb bonds
+
+    // Loop through i's bonds looking for hyb bonds (non-dummy bonds)
     int ib = 0;
     while (ib < num_bond[i]) {
-      // Get bond type for this pair from complementarity map
-      jtag = bond_atom[i][ib];
-      btype_ij = get_bond_type(itag, jtag);
-      
-      // Skip if this is not a hyb bond (it's either dummy or non-complementary bond)
-      if (btype_ij == 0 || bond_type[i][ib] != btype_ij) {
+      // Skip dummy bonds - they're handled in the second pass
+      if (bond_type[i][ib] == dummy_btype) {
         ib++;
         continue;
       }
-      
-      // This is a hyb bond - check distance
+
+      // This is a hyb bond - get partner info
+      jtag = bond_atom[i][ib];
       j = atom->map(jtag);
       if (j < 0) {
         // Partner not found - this indicates ghost cutoff is too small
         error->one(FLERR,"Fix dnafold/bond/hyb: Bonded atom not found in ghost atoms. "
                          "Increase communication cutoff with 'comm_modify cutoff'");
       }
-      
+
       // Check distance with minimum image convention
       delx = xtmp - x[j][0];
       dely = ytmp - x[j][1];
@@ -453,26 +554,46 @@ void FixDnafoldBondHyb::post_integrate()
         else if (delz < -domain->zprd_half) delz += domain->zprd;
       }
       rsq = delx*delx + dely*dely + delz*delz;
-      
+
+      // Get the correct bond type at current temperature
+      int correct_btype = get_bond_type(itag, jtag);
+
+      // Determine action: downgrade to dummy, update bond type, or keep as-is
+      bool should_downgrade = false;
+
       if (rsq > cutoffsq) {
-        // Too far - downgrade to dummy bond
+        // Too far - downgrade to dummy
+        should_downgrade = true;
+      } else if (correct_btype == 0) {
+        // Energy dropped below threshold at current T - downgrade to dummy
+        should_downgrade = true;
+      }
+
+      if (should_downgrade) {
+        // Downgrade to dummy bond
         bond_type[i][ib] = dummy_btype;
-        
+
         // Calculate min_size and subtract from hyb_status for both atoms
         int min_size = (size[i] < size[j]) ? size[i] : size[j];
         hyb_status[i] -= min_size;
-        
+
         // Also update j's hyb_status if j is local
         if (j < nlocal) hyb_status[j] -= min_size;
-        
+
         // If i is type 1, mark for angle removal
         if (itype == iatomtype) {
           downgraded_type1_tags.push_back(itag);
         }
-        
+
         downgradecount++;
+      } else if (bond_type[i][ib] != correct_btype) {
+        // Bond type changed due to temperature - update it
+        // This could be upgrade (stronger) or downgrade (weaker) within hyb bonds
+        bond_type[i][ib] = correct_btype;
+        updatecount++;
+        // Note: hyb_status doesn't change since it's still a hyb bond
       }
-      
+
       ib++;
     }
   }
@@ -694,19 +815,31 @@ void FixDnafoldBondHyb::post_integrate()
     createcount++;
   }
 
-  int createcountall, downgradecountall;
+  int createcountall, downgradecountall, updatecountall;
   MPI_Allreduce(&createcount,&createcountall,1,MPI_INT,MPI_SUM,world);
   MPI_Allreduce(&downgradecount,&downgradecountall,1,MPI_INT,MPI_SUM,world);
+  MPI_Allreduce(&updatecount,&updatecountall,1,MPI_INT,MPI_SUM,world);
   createcounttotal += createcountall;
   downgradecounttotal += downgradecountall;
   createcount = createcountall;
   downgradecount = downgradecountall;
 
-  // If any bonds were created or downgraded, rebuild special lists and trigger reneighboring
-  if (createcount || downgradecount) {
-    next_reneighbor = update->ntimestep;
+  // If any bonds were created, downgraded, or updated, rebuild special lists and trigger reneighboring
+  if (createcount || downgradecount || updatecountall) {
+    // Suppress output from Special::build()
+    FILE *screen_save = screen;
+    FILE *logfile_save = logfile;
+    screen = nullptr;
+    logfile = nullptr;
+
     Special special(lmp);
     special.build();
+
+    // Restore output
+    screen = screen_save;
+    logfile = logfile_save;
+
+    next_reneighbor = update->ntimestep;
   }
 }
 
