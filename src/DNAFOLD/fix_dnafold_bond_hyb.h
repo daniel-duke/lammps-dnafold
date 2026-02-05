@@ -11,6 +11,10 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   DNAFOLD package: Coarse-grained DNA origami folding simulation
+------------------------------------------------------------------------- */
+
 #ifdef FIX_CLASS
 // clang-format off
 FixStyle(dnafold/bond/hyb,FixDnafoldBondHyb);
@@ -21,80 +25,89 @@ FixStyle(dnafold/bond/hyb,FixDnafoldBondHyb);
 #define LMP_FIX_DNAFOLD_BOND_HYB_H
 
 #include "fix.h"
+
 #include <unordered_map>
+#include <vector>
 
 namespace LAMMPS_NS {
-
-// Hash function for pair of tagints
-struct PairHash {
-  std::size_t operator()(const std::pair<tagint, tagint> &p) const {
-    return std::hash<tagint>()(p.first) ^ (std::hash<tagint>()(p.second) << 1);
-  }
-};
 
 class FixDnafoldBondHyb : public Fix {
  public:
   FixDnafoldBondHyb(class LAMMPS *, int, char **);
   ~FixDnafoldBondHyb() override;
+
   int setmask() override;
   void init() override;
   void setup(int) override;
   void post_integrate() override;
   double compute_vector(int) override;
   double memory_usage() override;
+
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
   int pack_reverse_comm(int, int, double *) override;
   void unpack_reverse_comm(int, int *, double *) override;
 
  private:
+  // === MPI info ===
   int me, nprocs;
-  int iatomtype, jatomtype;      // atom types (1 and 2)
-  int dummy_btype;               // dummy bond type to ignore/remove
-  double cutoffsq;               // distance cutoff squared
-  char *complementarity_file;    // file containing complementarity pairs and bond types
-  int property_flag_index;       // index for i_hyb_status in atom->ivector
-  int size_index;                // index for i_size in atom->ivector
-  int createcount;               // bonds created this timestep
-  int downgradecount;            // bonds downgraded this timestep
-  bigint createcounttotal;       // cumulative bonds created
-  bigint downgradecounttotal;    // cumulative bonds downgraded
 
-  // Temperature-dependent complementarity data
-  std::vector<double> temperatures;     // list of temperatures from file
-  int num_temperatures;                  // number of temperature points
+  // === Atom type info ===
+  int iatomtype, jatomtype;
 
-  // Complementarity map: (tag1, tag2) -> vector of energies at each temperature
-  // tag1 < tag2 always
+  // === Bond parameters ===
+  int dummy_bond_type;
+  double cutoff_sq;
+  char *complementarity_file;
+
+  // === Property indices ===
+  int hyb_status_index;
+  int size_index;
+
+  // === Temperature data ===
+  std::vector<double> temperatures;
+  int num_temperatures;
+  char *tvar;
+  int tvar_index;
+
+  // === Complementarity data ===
+  // Hash function for pair of tagints
+  struct PairHash {
+    std::size_t operator()(const std::pair<tagint, tagint> &p) const {
+      return std::hash<tagint>()(p.first) ^ (std::hash<tagint>()(p.second) << 1);
+    }
+  };
+  // Map: (tag1, tag2) -> vector of energies at each temperature
+  // tag1 < tag2 always for consistent lookup
   std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHash> complementarity_map;
 
   // Energy levels: sorted pairs of (energy_depth, bond_type)
   // Sorted in descending order by energy_depth (highest energy = strongest bond)
   std::vector<std::pair<double, int>> energy_levels;
 
-  // Temperature variable access
-  char *tvar;                            // name of temperature variable (without v_ prefix)
-  int tvar_index;                        // index of temperature variable
+  // === Counters ===
+  // Output vector: [0]=created, [1]=total_created, [2]=downgraded, [3]=total_downgraded
+  int create_count, downgrade_count;
+  bigint create_count_total, downgrade_count_total;
 
-  // Arrays for partner selection across processors
-  int nmax;                      // size of per-atom arrays
-  tagint *partner;               // tag of bond partner for each atom
-  tagint *finalpartner;          // final partner after communication
-  int *partnerbtype;             // bond type for the partner
-  double *distsq;                // distance squared with partner
-  double *partner_energy;        // energy_depth of partner bond
-  int commflag;                  // flag for communication mode
+  // === Communication arrays ===
+  int nmax;
+  tagint *partner;
+  tagint *final_partner;
+  int *partner_bond_type;
+  double *dist_sq;
+  double *partner_energy;
+  int commflag;
 
-  void read_complementarity_file();     // read complementarity pairs from file
-  double get_interpolated_energy(tagint, tagint); // get energy at current temperature
-  int get_bond_type(tagint, tagint);    // get bond type for a pair (returns 0 if not complementary)
-  double get_energy_depth(tagint, tagint); // get energy_depth for a pair (returns BIG if not complementary)
-  void remove_dummy_bond(int, int);     // remove dummy bond between two atoms
+  // === Helper functions ===
+  void read_complementarity_file();
+  double get_interpolated_energy(tagint, tagint);
+  int get_bond_type(tagint, tagint);
+  double get_energy_depth(tagint, tagint);
+  void remove_dummy_bond(int, int);
 };
 
 }    // namespace LAMMPS_NS
 
 #endif
 #endif
-
-

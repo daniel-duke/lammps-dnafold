@@ -11,6 +11,16 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   DNAFOLD package: Coarse-grained DNA origami folding simulation
+
+   fix dnafold/bond/half creates and breaks "half-bonds" between
+   same-type half-beads (size=1) that share a common central whole-bead
+   (size=2). These bonds connect half-beads on opposite strands that
+   are each bonded to the same central bead, helping maintain the
+   geometry of partially hybridized regions.
+------------------------------------------------------------------------- */
+
 #include "fix_dnafold_bond_half.h"
 
 #include "atom.h"
@@ -35,43 +45,53 @@ using namespace FixConst;
 FixDnafoldBondHalf::FixDnafoldBondHalf(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), bond_requests(nullptr)
 {
+  // syntax: fix ID group dnafold/bond/half nevery cutoff bond_type
   if (narg != 6) error->all(FLERR,"Illegal fix dnafold/bond/half command");
 
   MPI_Comm_rank(world,&me);
   MPI_Comm_size(world,&nprocs);
 
+  // parse nevery - how often to check for bond creation/breaking
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
   if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half nevery");
 
+  // parse cutoff distance for half-bond creation and breaking
   double cutoff = utils::numeric(FLERR,arg[4],false,lmp);
   if (cutoff <= 0.0) error->all(FLERR,"Illegal fix dnafold/bond/half cutoff");
   cutoff_sq = cutoff * cutoff;
 
-  bond_type = utils::inumeric(FLERR,arg[5],false,lmp);
-  if (bond_type <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half bond_type");
+  // parse the bond type to use for half-bonds
+  half_bond_type = utils::inumeric(FLERR,arg[5],false,lmp);
+  if (half_bond_type <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half bond_type");
 
-  type1 = 1;
-  type2 = 2;
+  // half-bonds form between same-type atoms (both type 1 or both type 2)
+  // but we search from central atoms that are type 1 or type 2
+  iatomtype = 1;
+  jatomtype = 2;
 
+  // set up fix flags for reneighboring and output vector
   force_reneighbor = 1;
   next_reneighbor = update->ntimestep + 1;
-  
+
   vector_flag = 1;
   size_vector = 4;  // create, break, total create, total break
   global_freq = 1;
   extvector = 0;
 
-  createcount = 0;
-  breakcount = 0;
-  createcounttotal = 0;
-  breakcounttotal = 0;
+  // initialize counters
+  create_count = 0;
+  break_count = 0;
+  create_count_total = 0;
+  break_count_total = 0;
 
+  // initialize communication arrays
   nmax = 0;
-  maxrequest = 0;
+  max_requests = 0;
   num_requests = 0;
 
+  // reverse comm sends 3 values per request: tag1, tag2, bond_type
   comm_forward = 0;
-  comm_reverse = 3;  // tag1, tag2, bond_type
+  comm_reverse = 3;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -94,19 +114,23 @@ int FixDnafoldBondHalf::setmask()
 
 void FixDnafoldBondHalf::init()
 {
+  // validate system is molecular
   if (atom->molecular != Atom::MOLECULAR)
     error->all(FLERR,"Cannot use fix dnafold/bond/half with non-molecular system");
-  
+
+  // validate bond style is defined
   if (force->bond == nullptr)
     error->all(FLERR,"Must define bond_style for fix dnafold/bond/half");
 
-  if (bond_type > atom->nbondtypes)
+  // validate half bond type is within range
+  if (half_bond_type > atom->nbondtypes)
     error->all(FLERR,"Invalid bond type in fix dnafold/bond/half");
 
+  // require newton bond on for proper bond storage
   if (force->newton_bond == 0)
     error->all(FLERR,"Fix dnafold/bond/half requires newton bond on");
 
-  // Find the i_size property
+  // find the size custom property (1 for half-beads, 2 for whole beads)
   int flag_size, cols_size;
   size_index = atom->find_custom("size", flag_size, cols_size);
   if (size_index < 0)
@@ -122,45 +146,49 @@ void FixDnafoldBondHalf::setup(int /* vflag */)
   post_integrate();
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Main function called every nevery timesteps.
+   Two phases: (1) break stretched bonds, (2) create new bonds.
+------------------------------------------------------------------------- */
 
 void FixDnafoldBondHalf::post_integrate()
 {
   if (update->ntimestep % nevery) return;
 
-  // Acquire updated ghost atom positions
+  // acquire updated ghost atom positions
   comm->forward_comm();
 
   int nlocal = atom->nlocal;
-  
-  createcount = 0;
-  breakcount = 0;
+
+  // reset per-step counters
+  create_count = 0;
+  break_count = 0;
   num_requests = 0;
 
-  // First: break stretched bonds
+  // phase 1: break half-bonds that have stretched beyond cutoff
   break_stretched_bonds();
 
-  // Second: create new bonds between same-type atoms
+  // phase 2: create new half-bonds between eligible same-type neighbors
   create_same_type_bonds();
 
-  // Communicate bond creation requests to ghost home processors
+  // send bond creation requests to ghost atoms' home processors
   if (num_requests > 0) {
     comm->reverse_comm(this);
   }
 
-  // Accumulate counts across processors
-  int createcountall, breakcountall;
-  MPI_Allreduce(&createcount, &createcountall, 1, MPI_INT, MPI_SUM, world);
-  MPI_Allreduce(&breakcount, &breakcountall, 1, MPI_INT, MPI_SUM, world);
-  
-  createcounttotal += createcountall;
-  breakcounttotal += breakcountall;
-  createcount = createcountall;
-  breakcount = breakcountall;
+  // accumulate counts across all MPI processors
+  int create_count_all, break_count_all;
+  MPI_Allreduce(&create_count, &create_count_all, 1, MPI_INT, MPI_SUM, world);
+  MPI_Allreduce(&break_count, &break_count_all, 1, MPI_INT, MPI_SUM, world);
 
-  // If any bonds were created or removed, rebuild special lists and trigger reneighboring
-  if (createcount > 0 || breakcount > 0) {
-    // Suppress output from Special::build()
+  create_count_total += create_count_all;
+  break_count_total += break_count_all;
+  create_count = create_count_all;
+  break_count = break_count_all;
+
+  // if any bonds changed, rebuild special neighbor lists and trigger reneighboring
+  if (create_count > 0 || break_count > 0) {
+    // suppress verbose output from Special::build()
     FILE *screen_save = screen;
     FILE *logfile_save = logfile;
     screen = nullptr;
@@ -169,24 +197,29 @@ void FixDnafoldBondHalf::post_integrate()
     Special special(lmp);
     special.build();
 
-    // Restore output
+    // restore output streams
     screen = screen_save;
     logfile = logfile_save;
 
     next_reneighbor = update->ntimestep;
 
+    // log bond changes
     if (me == 0) {
       if (screen_save)
         fprintf(screen_save,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
-                createcount, breakcount, update->ntimestep);
+                create_count, break_count, update->ntimestep);
       if (logfile_save)
         fprintf(logfile_save,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
-                createcount, breakcount, update->ntimestep);
+                create_count, break_count, update->ntimestep);
     }
   }
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Create half-bonds between same-type half-beads that share a common
+   central whole-bead. We loop over central atoms (size=2) and look for
+   pairs of opposite-type neighbors (relative to center) with size=1.
+------------------------------------------------------------------------- */
 
 void FixDnafoldBondHalf::create_same_type_bonds()
 {
@@ -198,59 +231,61 @@ void FixDnafoldBondHalf::create_same_type_bonds()
   int **nspecial = atom->nspecial;
   int *num_bond = atom->num_bond;
   tagint **bond_atom = atom->bond_atom;
-  int **bond_type_arr = atom->bond_type;
+  int **bond_type = atom->bond_type;
   int *size = atom->ivector[size_index];
   double **x = atom->x;
 
-  // Loop over local atoms as central atoms
+  // loop over local atoms as potential central atoms
   for (int i = 0; i < nlocal; i++) {
     if (!(mask[i] & groupbit)) continue;
-    
-    int itype = type[i];
-    if (itype != type1 && itype != type2) continue;
 
-    // Central atom must have size = 2
+    int itype = type[i];
+    if (itype != iatomtype && itype != jatomtype) continue;
+
+    // central atom must be a whole bead (size = 2)
     if (size[i] != 2) continue;
 
-    // Collect all opposite-type bonded neighbors with size = 1
+    // collect all bonded neighbors that are:
+    // - opposite type from central atom
+    // - half-beads (size = 1)
     std::vector<int> opposite_neighbors;
-    
+
     for (int n = 0; n < nspecial[i][0]; n++) {
       tagint ntag = special[i][n];
       int nloc = atom->map(ntag);
-      
-      if (nloc < 0) continue;  // Not on this processor
+
+      if (nloc < 0) continue;  // neighbor not on this processor
       if (!(mask[nloc] & groupbit)) continue;
-      
+
       int ntype = type[nloc];
-      
-      // Check if opposite type
-      if ((itype == type1 && ntype == type2) || (itype == type2 && ntype == type1)) {
-        // Check if neighbor has size = 1
+
+      // check if neighbor is opposite type from central atom
+      if ((itype == iatomtype && ntype == jatomtype) || (itype == jatomtype && ntype == iatomtype)) {
+        // check if neighbor is a half-bead
         if (size[nloc] == 1) {
           opposite_neighbors.push_back(nloc);
         }
       }
     }
-    
-    // Check all pairs of opposite-type neighbors (both size 1)
+
+    // check all pairs of opposite-type neighbors for potential half-bond creation
+    // these pairs have the same type as each other (both opposite from center)
     for (size_t a = 0; a < opposite_neighbors.size(); a++) {
       for (size_t b = a+1; b < opposite_neighbors.size(); b++) {
         int j = opposite_neighbors[a];
         int k = opposite_neighbors[b];
-        
+
         tagint jtag = tag[j];
         tagint ktag = tag[k];
-        
-        // j and k are both bonded to i, are the same type (opposite of i), and both size 1
-        // Check if they're already bonded to each other
-        if (atoms_bonded(j, k)) continue;
-        
-        // Check distance between j and k (with minimum image)
+
+        // skip if j and k are already bonded to each other
+        if (are_atoms_bonded(j, k)) continue;
+
+        // calculate distance between j and k with minimum image convention
         double delx = x[j][0] - x[k][0];
         double dely = x[j][1] - x[k][1];
         double delz = x[j][2] - x[k][2];
-        
+
         if (domain->xperiodic) {
           if (delx > domain->xprd_half) delx -= domain->xprd;
           else if (delx < -domain->xprd_half) delx += domain->xprd;
@@ -263,34 +298,36 @@ void FixDnafoldBondHalf::create_same_type_bonds()
           if (delz > domain->zprd_half) delz -= domain->zprd;
           else if (delz < -domain->zprd_half) delz += domain->zprd;
         }
-        
+
         double rsq = delx*delx + dely*dely + delz*delz;
+
+        // skip if beyond cutoff distance
         if (rsq > cutoff_sq) continue;
-        
-        // Determine which is lower tagged
+
+        // determine which atom has the lower tag for consistent bond storage
         tagint lower_tag = (jtag < ktag) ? jtag : ktag;
         tagint higher_tag = (jtag < ktag) ? ktag : jtag;
         int lower_local = (jtag < ktag) ? j : k;
-        
-        // Create bond on lower-tagged atom
+
+        // create bond on lower-tagged atom (newton bond convention)
         if (lower_local < nlocal) {
-          // Lower-tagged atom is local - create directly
+          // lower-tagged atom is local - create bond directly
           if (num_bond[lower_local] >= atom->bond_per_atom)
             error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/half");
-          
-          bond_type_arr[lower_local][num_bond[lower_local]] = bond_type;
+
+          bond_type[lower_local][num_bond[lower_local]] = half_bond_type;
           bond_atom[lower_local][num_bond[lower_local]] = higher_tag;
           num_bond[lower_local]++;
-          createcount++;
+          create_count++;
         } else {
-          // Lower-tagged atom is ghost - queue for reverse comm
-          if (num_requests >= maxrequest) {
-            maxrequest += 100;
-            memory->grow(bond_requests, maxrequest, 3, "fix_dnafold_bond_half:bond_requests");
+          // lower-tagged atom is a ghost - queue request for reverse communication
+          if (num_requests >= max_requests) {
+            max_requests += 100;
+            memory->grow(bond_requests, max_requests, 3, "fix_dnafold_bond_half:bond_requests");
           }
           bond_requests[num_requests][0] = lower_tag;
           bond_requests[num_requests][1] = higher_tag;
-          bond_requests[num_requests][2] = bond_type;
+          bond_requests[num_requests][2] = half_bond_type;
           num_requests++;
         }
       }
@@ -298,56 +335,63 @@ void FixDnafoldBondHalf::create_same_type_bonds()
   }
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Break half-bonds that have stretched beyond the cutoff distance.
+   Only processes bonds of type half_bond_type between half-beads.
+------------------------------------------------------------------------- */
 
 void FixDnafoldBondHalf::break_stretched_bonds()
 {
   int nlocal = atom->nlocal;
   double **x = atom->x;
   int *num_bond = atom->num_bond;
-  int **bond_type_arr = atom->bond_type;
+  int **bond_type = atom->bond_type;
   tagint **bond_atom = atom->bond_atom;
   int *type = atom->type;
   int *size = atom->ivector[size_index];
-  
+
+  // loop over local atoms
   for (int i = 0; i < nlocal; i++) {
     int k = 0;
+
+    // loop through bonds using while loop since we may remove bonds
     while (k < num_bond[i]) {
-      if (bond_type_arr[i][k] != bond_type) {
+      // skip if not a half-bond
+      if (bond_type[i][k] != half_bond_type) {
         k++;
         continue;
       }
-      
-      // Atom i must be a half-bead (size == 1)
+
+      // atom i must be a half-bead (size == 1) for this to be a valid half-bond
       if (size[i] != 1) {
         k++;
         continue;
       }
-      
-      // Find the partner atom
+
+      // find the partner atom
       tagint j_tag = bond_atom[i][k];
       int j = atom->map(j_tag);
-      
+
+      // partner not found - remove the bond
       if (j < 0) {
-        // Partner atom not found - remove bond
         num_bond[i]--;
         bond_atom[i][k] = bond_atom[i][num_bond[i]];
-        bond_type_arr[i][k] = bond_type_arr[i][num_bond[i]];
-        breakcount++;
-        continue;  // Don't increment k since we shifted
+        bond_type[i][k] = bond_type[i][num_bond[i]];
+        break_count++;
+        continue;  // don't increment k since we shifted
       }
-      
-      // Partner must also be a half-bead (size == 1) and same type as i
+
+      // partner must also be a half-bead (size == 1) and same type as i
       if (size[j] != 1 || type[j] != type[i]) {
         k++;
         continue;
       }
-      
-      // Calculate distance with minimum image convention
+
+      // calculate distance with minimum image convention
       double delx = x[i][0] - x[j][0];
       double dely = x[i][1] - x[j][1];
       double delz = x[i][2] - x[j][2];
-      
+
       if (domain->xperiodic) {
         if (delx > domain->xprd_half) delx -= domain->xprd;
         else if (delx < -domain->xprd_half) delx += domain->xprd;
@@ -360,16 +404,16 @@ void FixDnafoldBondHalf::break_stretched_bonds()
         if (delz > domain->zprd_half) delz -= domain->zprd;
         else if (delz < -domain->zprd_half) delz += domain->zprd;
       }
-      
+
       double rsq = delx*delx + dely*dely + delz*delz;
-      
+
+      // break bond if stretched beyond cutoff
       if (rsq > cutoff_sq) {
-        // Break this bond - remove from atom i
         num_bond[i]--;
         bond_atom[i][k] = bond_atom[i][num_bond[i]];
-        bond_type_arr[i][k] = bond_type_arr[i][num_bond[i]];
-        breakcount++;
-        // Don't increment k since we moved the last bond into this position
+        bond_type[i][k] = bond_type[i][num_bond[i]];
+        break_count++;
+        // don't increment k since we moved the last bond into this position
       } else {
         k++;
       }
@@ -377,40 +421,48 @@ void FixDnafoldBondHalf::break_stretched_bonds()
   }
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Check if two atoms are bonded using the special neighbor list.
+   Returns 1 if bonded (j is in i's 1-2 neighbor list), 0 otherwise.
+------------------------------------------------------------------------- */
 
-int FixDnafoldBondHalf::atoms_bonded(int i, int j)
+int FixDnafoldBondHalf::are_atoms_bonded(int i, int j)
 {
-  tagint *tag = atom->tag;
-  tagint **special = atom->special;
-  int **nspecial = atom->nspecial;
+  tagint jtag = atom->tag[j];
+  tagint *slist = atom->special[i];
+  int n1 = atom->nspecial[i][0];
 
-  tagint jtag = tag[j];
-
-  // Check if j is in i's 1-2 neighbor list
-  for (int k = 0; k < nspecial[i][0]; k++) {
-    if (special[i][k] == jtag) return 1;
+  // check if j is in i's 1-2 (directly bonded) neighbor list
+  for (int k = 0; k < n1; k++) {
+    if (slist[k] == jtag) return 1;
   }
 
   return 0;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Pack bond creation requests for reverse communication.
+   Sends requests to home processors of ghost atoms.
+------------------------------------------------------------------------- */
 
 int FixDnafoldBondHalf::pack_reverse_comm(int n, int first, double *buf)
 {
   int m = 0;
-  
+
+  // pack all queued bond requests into buffer
   for (int i = 0; i < num_requests; i++) {
-    buf[m++] = ubuf(bond_requests[i][0]).d;
-    buf[m++] = ubuf(bond_requests[i][1]).d;
-    buf[m++] = ubuf(bond_requests[i][2]).d;
+    buf[m++] = ubuf(bond_requests[i][0]).d;  // tag1 (lower)
+    buf[m++] = ubuf(bond_requests[i][1]).d;  // tag2 (higher)
+    buf[m++] = ubuf(bond_requests[i][2]).d;  // bond type
   }
-  
+
   return m;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Unpack bond creation requests from reverse communication.
+   Creates bonds on local atoms that were requested by other processors.
+------------------------------------------------------------------------- */
 
 void FixDnafoldBondHalf::unpack_reverse_comm(int n, int *list, double *buf)
 {
@@ -418,41 +470,43 @@ void FixDnafoldBondHalf::unpack_reverse_comm(int n, int *list, double *buf)
   tagint *tag = atom->tag;
   int *num_bond = atom->num_bond;
   tagint **bond_atom = atom->bond_atom;
-  int **bond_type_arr = atom->bond_type;
+  int **bond_type = atom->bond_type;
   int nlocal = atom->nlocal;
-  
-  // Receive bond creation requests
+
+  // number of bond requests received
   int num_recv = n / 3;
-  
+
+  // process each received bond creation request
   for (int i = 0; i < num_recv; i++) {
     tagint tag1 = (tagint) ubuf(buf[m++]).i;
     tagint tag2 = (tagint) ubuf(buf[m++]).i;
     int btype = (int) ubuf(buf[m++]).i;
-    
-    // Find local atom with tag1 (should be local since we sent it here)
+
+    // find local atom with tag1 (should be local since request was sent here)
     int iloc = atom->map(tag1);
-    
-    if (iloc < 0 || iloc >= nlocal) continue;  // Safety check
-    
-    // Check if bond already exists
+
+    // safety check: must be a local atom
+    if (iloc < 0 || iloc >= nlocal) continue;
+
+    // check if this bond already exists (avoid duplicates)
     int already_exists = 0;
     for (int k = 0; k < num_bond[iloc]; k++) {
-      if (bond_atom[iloc][k] == tag2 && bond_type_arr[iloc][k] == btype) {
+      if (bond_atom[iloc][k] == tag2 && bond_type[iloc][k] == btype) {
         already_exists = 1;
         break;
       }
     }
-    
+
     if (already_exists) continue;
-    
-    // Create the bond
+
+    // create the bond
     if (num_bond[iloc] >= atom->bond_per_atom)
       error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/half");
-    
-    bond_type_arr[iloc][num_bond[iloc]] = btype;
+
+    bond_type[iloc][num_bond[iloc]] = btype;
     bond_atom[iloc][num_bond[iloc]] = tag2;
     num_bond[iloc]++;
-    createcount++;
+    create_count++;
   }
 }
 
@@ -460,17 +514,17 @@ void FixDnafoldBondHalf::unpack_reverse_comm(int n, int *list, double *buf)
 
 double FixDnafoldBondHalf::compute_vector(int n)
 {
-  if (n == 0) return (double) createcount;
-  if (n == 1) return (double) breakcount;
-  if (n == 2) return (double) createcounttotal;
-  return (double) breakcounttotal;
+  // output vector: [0]=created, [1]=broken, [2]=total_created, [3]=total_broken
+  if (n == 0) return (double) create_count;
+  if (n == 1) return (double) break_count;
+  if (n == 2) return (double) create_count_total;
+  return (double) break_count_total;
 }
 
 /* ---------------------------------------------------------------------- */
 
 double FixDnafoldBondHalf::memory_usage()
 {
-  double bytes = (double)maxrequest * 3 * sizeof(tagint);
+  double bytes = (double)max_requests * 3 * sizeof(tagint);
   return bytes;
 }
-

@@ -11,6 +11,10 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   DNAFOLD package: Coarse-grained DNA origami folding simulation
+------------------------------------------------------------------------- */
+
 #ifdef FIX_CLASS
 // clang-format off
 FixStyle(dnafold/bond/pre,FixDnafoldBondPre);
@@ -21,22 +25,17 @@ FixStyle(dnafold/bond/pre,FixDnafoldBondPre);
 #define LMP_FIX_DNAFOLD_BOND_PRE_H
 
 #include "fix.h"
+
 #include <unordered_map>
 #include <vector>
 
 namespace LAMMPS_NS {
 
-// Hash function for pair of tagints
-struct PairHashPre {
-  std::size_t operator()(const std::pair<tagint, tagint> &p) const {
-    return std::hash<tagint>()(p.first) ^ (std::hash<tagint>()(p.second) << 1);
-  }
-};
-
 class FixDnafoldBondPre : public Fix {
  public:
   FixDnafoldBondPre(class LAMMPS *, int, char **);
   ~FixDnafoldBondPre() override;
+
   int setmask() override;
   void init() override;
   void init_list(int, class NeighList *) override;
@@ -46,41 +45,56 @@ class FixDnafoldBondPre : public Fix {
   double memory_usage() override;
 
  private:
+  // === MPI info ===
   int me, nprocs;
-  int iatomtype, jatomtype;      // atom types (1 and 2)
-  int dummy_btype;               // dummy bond type
-  double cutoffsq;               // distance cutoff squared
-  char *complementarity_file;    // file containing complementarity pairs
-  int hyb_status_index;          // index for i_hyb_status in atom->ivector
-  int size_index;                // index for i_size in atom->ivector
-  int createcount;               // bonds created this timestep
-  int removecount;               // bonds removed this timestep
-  bigint createcounttotal;       // cumulative bonds created
-  bigint removecounttotal;       // cumulative bonds removed
 
-  class NeighList *list;         // neighbor list
+  // === Atom type info ===
+  int iatomtype, jatomtype;
 
-  // Temperature-dependent complementarity data
-  std::vector<double> temperatures;     // list of temperatures from file
-  int num_temperatures;                  // number of temperature points
-  double min_energy_threshold;           // minimum energy for bond formation (from TYPES)
+  // === Bond parameters ===
+  int dummy_bond_type;
+  double cutoff_sq;
+  char *complementarity_file;
 
-  // Map of complementary pairs: (tag1, tag2) -> vector of energies at each temperature
-  std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHashPre> complementarity_map;
+  // === Property indices ===
+  int hyb_status_index;
+  int size_index;
 
-  // Temperature variable access
-  char *tvar;                            // name of temperature variable (without v_ prefix)
-  int tvar_index;                        // index of temperature variable
+  // === Temperature data ===
+  std::vector<double> temperatures;
+  int num_temperatures;
+  double min_energy_threshold;
+  char *tvar;
+  int tvar_index;
 
-  void read_complementarity_file();      // read complementarity pairs from file
-  double get_interpolated_energy(tagint, tagint); // get energy at current temperature
-  bool is_complementary(tagint, tagint); // check if pair is complementary at current T
-  bool dummy_bond_exists(int, int);      // check if dummy bond exists between two atoms
-  bool any_bond_exists(int, int);        // check if any bond exists between two atoms
+  // === Complementarity data ===
+  // Hash function for pair of tagints
+  struct PairHash {
+    std::size_t operator()(const std::pair<tagint, tagint> &p) const {
+      return std::hash<tagint>()(p.first) ^ (std::hash<tagint>()(p.second) << 1);
+    }
+  };
+  // Map: (tag1, tag2) -> vector of energies at each temperature
+  // tag1 < tag2 always for consistent lookup
+  std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHash> complementarity_map;
+
+  // === Counters ===
+  // Output vector: [0]=created, [1]=removed, [2]=total_created, [3]=total_removed
+  int create_count, remove_count;
+  bigint create_count_total, remove_count_total;
+
+  // === Neighbor list ===
+  class NeighList *list;
+
+  // === Helper functions ===
+  void read_complementarity_file();
+  double get_interpolated_energy(tagint, tagint);
+  bool is_complementary(tagint, tagint);
+  bool has_dummy_bond(int, int);
+  bool has_any_bond(int, int);
 };
 
 }    // namespace LAMMPS_NS
 
 #endif
 #endif
-

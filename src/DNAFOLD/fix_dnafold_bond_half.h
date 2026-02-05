@@ -11,6 +11,10 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   DNAFOLD package: Coarse-grained DNA origami folding simulation
+------------------------------------------------------------------------- */
+
 #ifdef FIX_CLASS
 // clang-format off
 FixStyle(dnafold/bond/half,FixDnafoldBondHalf);
@@ -28,39 +32,49 @@ class FixDnafoldBondHalf : public Fix {
  public:
   FixDnafoldBondHalf(class LAMMPS *, int, char **);
   ~FixDnafoldBondHalf() override;
+
   int setmask() override;
   void init() override;
   void setup(int) override;
   void post_integrate() override;
   double compute_vector(int) override;
   double memory_usage() override;
+
   int pack_reverse_comm(int, int, double *) override;
   void unpack_reverse_comm(int, int *, double *) override;
 
  private:
+  // === MPI info ===
   int me, nprocs;
-  int type1, type2;              // atom types (1 and 2)
-  int bond_type;                 // type of bond to create/break
-  double cutoff_sq;              // squared cutoff distance for breaking bonds
-  int size_index;                // index for i_size in atom->ivector
-  int createcount;               // bonds created this timestep
-  int breakcount;                // bonds broken this timestep
-  bigint createcounttotal;       // cumulative bonds created
-  bigint breakcounttotal;        // cumulative bonds broken
 
-  // Arrays for reverse communication of bond requests
-  int nmax;                      // size of per-atom arrays
-  int maxrequest;                // size of bond_requests array
-  int num_requests;              // number of bond requests to send
-  tagint **bond_requests;        // array of [tag1, tag2, bond_type] requests
+  // === Atom type info ===
+  int iatomtype, jatomtype;
 
-  void create_same_type_bonds(); // find and create bonds between same-type atoms
-  void break_stretched_bonds();  // break bonds that exceed cutoff
-  int atoms_bonded(int, int);    // check if two atoms are bonded
+  // === Bond parameters ===
+  int half_bond_type;
+  double cutoff_sq;
+
+  // === Property indices ===
+  int size_index;
+
+  // === Counters ===
+  // Output vector: [0]=created, [1]=broken, [2]=total_created, [3]=total_broken
+  int create_count, break_count;
+  bigint create_count_total, break_count_total;
+
+  // === Communication arrays ===
+  int nmax;
+  int max_requests;
+  int num_requests;
+  tagint **bond_requests;
+
+  // === Helper functions ===
+  void create_same_type_bonds();
+  void break_stretched_bonds();
+  int are_atoms_bonded(int, int);
 };
 
 }    // namespace LAMMPS_NS
 
 #endif
 #endif
-

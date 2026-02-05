@@ -11,6 +11,10 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   DNAFOLD package: Coarse-grained DNA origami folding simulation
+------------------------------------------------------------------------- */
+
 #ifdef FIX_CLASS
 // clang-format off
 FixStyle(dnafold/angle/hyb,FixDnafoldAngleHyb);
@@ -28,6 +32,7 @@ class FixDnafoldAngleHyb : public Fix {
  public:
   FixDnafoldAngleHyb(class LAMMPS *, int, char **);
   ~FixDnafoldAngleHyb() override;
+
   int setmask() override;
   void init() override;
   void setup(int) override;
@@ -36,21 +41,26 @@ class FixDnafoldAngleHyb : public Fix {
   double memory_usage() override;
 
  private:
+  // === MPI info ===
   int me, nprocs;
-  int hyb_status_index;          // index for i_hyb_status in atom->ivector
-  int is_crossover_index;        // index for i_is_crossover in atom->ivector
-  int size_index;                // index for i_size in atom->ivector
-  int createcount;               // angles created this timestep
-  bigint createcounttotal;       // cumulative angles created
 
-  void find_and_create_angles(); // search for and create angles
-  int angle_exists(int, int, int);  // check if angle already exists
-  int atoms_bonded(int, int);    // check if two atoms are bonded
+  // === Property indices ===
+  int hyb_status_index;
+  int is_crossover_index;
+  int size_index;
+
+  // === Counters ===
+  // Output vector: [0]=created, [1]=total_created
+  int create_count;
+  bigint create_count_total;
+
+  // === Helper functions ===
+  void find_and_create_angles();
+  int has_angle(int, int, int);
+  int are_atoms_bonded(int, int);
 };
 
 }    // namespace LAMMPS_NS
 
 #endif
 #endif
-
-

@@ -12,7 +12,13 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   Contributing author: Custom DNA folding simulation fix
+   DNAFOLD package: Coarse-grained DNA origami folding simulation
+
+   fix dnafold/angle/hyb creates angles between fully hybridized atoms.
+   Angles are created when a central atom and two of its bonded neighbors
+   are all fully hybridized (hyb_status == size). The angle type depends
+   on whether the central atom is at a crossover junction (is_crossover).
+   Angles are stored on the central atom.
 ------------------------------------------------------------------------- */
 
 #include "fix_dnafold_angle_hyb.h"
@@ -43,21 +49,25 @@ using namespace FixConst;
 FixDnafoldAngleHyb::FixDnafoldAngleHyb(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg)
 {
+  // syntax: fix ID group dnafold/angle/hyb nevery
   if (narg != 4) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
 
   MPI_Comm_rank(world,&me);
   MPI_Comm_size(world,&nprocs);
 
+  // parse nevery - how often to check for angle creation
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
   if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
 
+  // set up fix flags for output vector
   vector_flag = 1;
   size_vector = 2;
   global_freq = 1;
   extvector = 0;
 
-  createcount = 0;
-  createcounttotal = 0;
+  // initialize counters
+  create_count = 0;
+  create_count_total = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -79,7 +89,7 @@ int FixDnafoldAngleHyb::setmask()
 
 void FixDnafoldAngleHyb::init()
 {
-  // Find the i_hyb_status property (now an integer)
+  // find the hyb_status custom property (tracks hybridization slots used: 0-2)
   int flag_hyb, cols_hyb;
   hyb_status_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
   if (hyb_status_index < 0)
@@ -87,7 +97,7 @@ void FixDnafoldAngleHyb::init()
   if (flag_hyb != 0)
     error->all(FLERR,"Property i_hyb_status must be an integer property");
 
-  // Find the i_is_crossover property (now an integer)
+  // find the is_crossover custom property (1 if at crossover junction, 0 otherwise)
   int flag_cross, cols_cross;
   is_crossover_index = atom->find_custom("is_crossover", flag_cross, cols_cross);
   if (is_crossover_index < 0)
@@ -95,7 +105,7 @@ void FixDnafoldAngleHyb::init()
   if (flag_cross != 0)
     error->all(FLERR,"Property i_is_crossover must be an integer property");
 
-  // Find the i_size property (now an integer)
+  // find the size custom property (1 for half-beads, 2 for whole beads)
   int flag_size, cols_size;
   size_index = atom->find_custom("size", flag_size, cols_size);
   if (size_index < 0)
@@ -103,10 +113,11 @@ void FixDnafoldAngleHyb::init()
   if (flag_size != 0)
     error->all(FLERR,"Property i_size must be an integer property");
 
-  // Verify system supports angles
+  // validate system is molecular
   if (atom->molecular != Atom::MOLECULAR)
     error->all(FLERR,"Cannot use fix dnafold/angle/hyb with non-molecular system");
-  
+
+  // validate angle style is defined
   if (force->angle == nullptr)
     error->all(FLERR,"Cannot use fix dnafold/angle/hyb without angle_style defined");
 }
@@ -118,24 +129,28 @@ void FixDnafoldAngleHyb::setup(int /* vflag */)
   post_integrate();
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Main function called every nevery timesteps.
+   Finds fully hybridized atom triplets and creates angles.
+------------------------------------------------------------------------- */
 
 void FixDnafoldAngleHyb::post_integrate()
 {
   if (update->ntimestep % nevery) return;
 
+  // find and create angles for fully hybridized triplets
   find_and_create_angles();
 
-  // Sum angle creation across processors
-  int createcountall;
-  MPI_Allreduce(&createcount,&createcountall,1,MPI_INT,MPI_SUM,world);
-  createcounttotal += createcountall;
-  createcount = createcountall;
+  // accumulate counts across all MPI processors
+  int create_count_all;
+  MPI_Allreduce(&create_count,&create_count_all,1,MPI_INT,MPI_SUM,world);
+  create_count_total += create_count_all;
+  create_count = create_count_all;
 
-  // If any angles were created, rebuild special lists
+  // if any angles were created, rebuild special neighbor lists
   // (angles affect 1-3 special interactions)
-  if (createcount > 0) {
-    // Suppress output from Special::build()
+  if (create_count > 0) {
+    // suppress verbose output from Special::build()
     FILE *screen_save = screen;
     FILE *logfile_save = logfile;
     screen = nullptr;
@@ -144,13 +159,20 @@ void FixDnafoldAngleHyb::post_integrate()
     Special special(lmp);
     special.build();
 
-    // Restore output
+    // restore output streams
     screen = screen_save;
     logfile = logfile_save;
   }
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Find fully hybridized atom triplets and create angles.
+   An angle j-i-k is created when:
+   - Center atom i is fully hybridized (hyb_status[i] == size[i])
+   - Both end atoms j and k are bonded to i and fully hybridized
+   - Atoms j and k are not directly bonded to each other
+   - The angle doesn't already exist
+------------------------------------------------------------------------- */
 
 void FixDnafoldAngleHyb::find_and_create_angles()
 {
@@ -163,72 +185,76 @@ void FixDnafoldAngleHyb::find_and_create_angles()
   int **angle_atom2 = atom->angle_atom2;
   int **angle_atom3 = atom->angle_atom3;
   int *num_angle = atom->num_angle;
-  
-  // Get property arrays as integers
+
+  // get custom property arrays
   int *hyb_status = atom->ivector[hyb_status_index];
   int *is_crossover = atom->ivector[is_crossover_index];
   int *size = atom->ivector[size_index];
-  
-  // Get special bond arrays
+
+  // get special neighbor lists (1-2 = directly bonded atoms)
   tagint **special = atom->special;
   int **nspecial = atom->nspecial;
 
-  createcount = 0;
+  // reset per-step counter
+  create_count = 0;
 
-  // Loop over potential center atoms
+  // loop over local atoms as potential center atoms
   for (i = 0; i < nlocal; i++) {
-    
+
     if (!(mask[i] & groupbit)) continue;
-    
-    // Only create angles if hyb_status equals size (fully hybridized)
+
+    // only create angles for fully hybridized atoms
+    // fully hybridized means hyb_status equals the atom's size
     if (hyb_status[i] != size[i]) continue;
 
     tagint itag = tag[i];
-    
-    // Calculate angle type for this central atom: atype = 1 + is_crossover[i]
+
+    // angle type depends on whether center atom is at a crossover junction
+    // type 1 = normal angle, type 2 = crossover angle
     int atype = 1 + is_crossover[i];
-    
-    // Verify angle type is valid
+
+    // validate angle type is within range
     if (atype <= 0 || atype > atom->nangletypes)
       error->one(FLERR,"Fix dnafold/angle/hyb: Invalid angle type calculated from is_crossover");
-    
-    // Get bonded neighbors from special bond list
-    // special[i][0 ... nspecial[i][0]-1] contains directly bonded atoms
+
+    // collect bonded neighbors that are also fully hybridized
     std::vector<int> valid_neighbors;
-    
+
     for (int n = 0; n < nspecial[i][0]; n++) {
       tagint ntag = special[i][n];
       int nloc = atom->map(ntag);
-      
-      if (nloc < 0) continue;
+
+      if (nloc < 0) continue;  // neighbor not on this processor
       if (!(mask[nloc] & groupbit)) continue;
-      
-      // Neighbor must also be fully hybridized
+
+      // neighbor must also be fully hybridized
       if (hyb_status[nloc] != size[nloc]) continue;
-      
+
       valid_neighbors.push_back(nloc);
     }
-    
+
+    // need at least 2 valid neighbors to form an angle
     if (valid_neighbors.size() < 2) continue;
 
-    // Check all pairs of neighbors
+    // check all pairs of valid neighbors for angle creation
     for (size_t j_idx = 0; j_idx < valid_neighbors.size(); j_idx++) {
       int jlocal = valid_neighbors[j_idx];
       tagint jtag = tag[jlocal];
-      
+
       for (size_t k_idx = j_idx+1; k_idx < valid_neighbors.size(); k_idx++) {
         int klocal = valid_neighbors[k_idx];
         tagint ktag = tag[klocal];
-        
+
+        // skip if same atom (shouldn't happen, but safety check)
         if (jtag == ktag) continue;
-        
-        // Check that j and k are not bonded to each other
-        if (atoms_bonded(jlocal, klocal)) continue;
 
-        // Check if angle already exists
-        if (angle_exists(jlocal, i, klocal)) continue;
+        // skip if j and k are directly bonded (would form degenerate angle)
+        if (are_atoms_bonded(jlocal, klocal)) continue;
 
-        // Create angle j-i-k with angle type based on central atom's is_crossover
+        // skip if angle already exists
+        if (has_angle(jlocal, i, klocal)) continue;
+
+        // create angle j-i-k on center atom i
         if (num_angle[i] >= atom->angle_per_atom)
           error->one(FLERR,"Fix dnafold/angle/hyb: Too many angles per atom");
 
@@ -238,34 +264,38 @@ void FixDnafoldAngleHyb::find_and_create_angles()
         angle_atom3[i][num_angle[i]] = ktag;
         num_angle[i]++;
 
-        createcount++;
+        create_count++;
       }
     }
   }
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Check if two atoms are directly bonded using the special neighbor list.
+   Returns 1 if bonded (j is in i's 1-2 neighbor list), 0 otherwise.
+------------------------------------------------------------------------- */
 
-int FixDnafoldAngleHyb::atoms_bonded(int i, int j)
+int FixDnafoldAngleHyb::are_atoms_bonded(int i, int j)
 {
-  int *tag = atom->tag;
-  tagint **special = atom->special;
-  int **nspecial = atom->nspecial;
+  tagint jtag = atom->tag[j];
+  tagint *slist = atom->special[i];
+  int n1 = atom->nspecial[i][0];
 
-  tagint jtag = tag[j];
-
-  // Check special bond list (1-2 neighbors = directly bonded atoms)
-  // This is globally consistent and handles newton bond storage
-  for (int k = 0; k < nspecial[i][0]; k++) {
-    if (special[i][k] == jtag) return 1;
+  // check if j is in i's 1-2 (directly bonded) neighbor list
+  // this is globally consistent and handles newton bond storage
+  for (int k = 0; k < n1; k++) {
+    if (slist[k] == jtag) return 1;
   }
 
   return 0;
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Check if angle i-j-k already exists on center atom j.
+   Angles are stored on the center atom, so we only need to check j's list.
+------------------------------------------------------------------------- */
 
-int FixDnafoldAngleHyb::angle_exists(int i, int j, int k)
+int FixDnafoldAngleHyb::has_angle(int i, int j, int k)
 {
   int *tag = atom->tag;
   int **angle_atom1 = atom->angle_atom1;
@@ -275,8 +305,8 @@ int FixDnafoldAngleHyb::angle_exists(int i, int j, int k)
   tagint itag = tag[i];
   tagint ktag = tag[k];
 
-  // Check if angle i-j-k already exists on center atom j
-  // Angles are stored on the center atom, so we only check atom j's angle list
+  // check if angle i-j-k already exists on center atom j
+  // angles are symmetric: i-j-k is the same as k-j-i
   for (int m = 0; m < num_angle[j]; m++) {
     if ((angle_atom1[j][m] == itag && angle_atom3[j][m] == ktag) ||
         (angle_atom1[j][m] == ktag && angle_atom3[j][m] == itag)) {
@@ -291,8 +321,9 @@ int FixDnafoldAngleHyb::angle_exists(int i, int j, int k)
 
 double FixDnafoldAngleHyb::compute_vector(int n)
 {
-  if (n == 0) return (double) createcount;
-  return (double) createcounttotal;
+  // output vector: [0]=created, [1]=total_created
+  if (n == 0) return (double) create_count;
+  return (double) create_count_total;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -301,5 +332,3 @@ double FixDnafoldAngleHyb::memory_usage()
 {
   return 0.0;
 }
-
-
