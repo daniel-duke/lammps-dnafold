@@ -280,11 +280,13 @@ void FixDnafoldBondHyb::read_complementarity_file()
       }
 
       // parse PAIRS section: read complementary atom pairs with per-temperature energies
+      // format: tag1 tag2 <ignored_column> energy1 energy2 ...
       if (current_section == PAIRS) {
         std::istringstream iss(line);
         tagint tag1, tag2;
+        std::string ignored_column;
 
-        if (!(iss >> tag1 >> tag2)) {
+        if (!(iss >> tag1 >> tag2 >> ignored_column)) {
           error->one(FLERR,fmt::format("Invalid PAIRS format in '{}' at line {}",
                                        complementarity_file, line_num));
         }
@@ -582,6 +584,7 @@ void FixDnafoldBondHyb::post_integrate()
   int local_downgrade_count = 0;
   int update_count = 0;
   std::vector<tagint> downgraded_type1_tags;  // track type 1 atoms for angle removal
+  std::vector<std::pair<tagint, int>> hyb_status_changes;  // track (tag, delta) for ghost atoms
 
   for (i = 0; i < nlocal; i++) {
     if (!(mask[i] & groupbit)) continue;
@@ -597,11 +600,11 @@ void FixDnafoldBondHyb::post_integrate()
     ytmp = x[i][1];
     ztmp = x[i][2];
 
-    // loop through i's bonds looking for hyb bonds (non-dummy)
+    // loop through i's bonds looking for hyb bonds
     int ib = 0;
     while (ib < num_bond[i]) {
-      // skip dummy bonds - they're handled in the second pass
-      if (bond_type[i][ib] == dummy_bond_type) {
+      // skip if not a hyb bond type (skip dummy bonds, backbone bonds, etc.)
+      if (!is_hyb_bond_type(bond_type[i][ib])) {
         ib++;
         continue;
       }
@@ -655,8 +658,12 @@ void FixDnafoldBondHyb::post_integrate()
         int min_size = (size[i] < size[j]) ? size[i] : size[j];
         hyb_status[i] -= min_size;
 
-        // also update j's hyb_status if j is local
-        if (j < nlocal) hyb_status[j] -= min_size;
+        // update j's hyb_status - track for broadcast if j is a ghost
+        if (j < nlocal) {
+          hyb_status[j] -= min_size;
+        } else {
+          hyb_status_changes.push_back(std::make_pair(jtag, -min_size));
+        }
 
         // if i is type 1, mark for angle removal
         if (itype == iatomtype) {
@@ -868,6 +875,21 @@ void FixDnafoldBondHyb::post_integrate()
     // this prevents duplicate bond creation across processors
     if (tag[i] > tag[j]) continue;
 
+    // DEFENSIVE: Re-validate types before bond creation
+    // This catches any race conditions in MPI communication
+    int itype_check = type[i];
+    int jtype_check = type[j];
+    if (!((itype_check == iatomtype && jtype_check == jatomtype) ||
+          (itype_check == jatomtype && jtype_check == iatomtype))) {
+      continue;
+    }
+
+    // Re-check capacity before creating bond
+    // (partner may have been set in previous timestep when capacity was available)
+    int min_size_check = (size[i] < size[j]) ? size[i] : size[j];
+    if (hyb_status[i] + min_size_check > MAX_HYB_CAPACITY) continue;
+    if (hyb_status[j] + min_size_check > MAX_HYB_CAPACITY) continue;
+
     if (num_bond[i] >= atom->bond_per_atom)
       error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/hyb");
 
@@ -883,13 +905,65 @@ void FixDnafoldBondHyb::post_integrate()
     int min_size = (size[i] < size[j]) ? size[i] : size[j];
     hyb_status[i] += min_size;
 
-    // also update j's hyb_status
-    hyb_status[j] += min_size;
+    // update j's hyb_status - track for broadcast if j is a ghost
+    if (j < nlocal) {
+      hyb_status[j] += min_size;
+    } else {
+      hyb_status_changes.push_back(std::make_pair(tag[j], min_size));
+    }
 
     // store final partners for bookkeeping
     final_partner[i] = tag[j];
 
     local_create_count++;
+  }
+
+  // ========== Broadcast hyb_status changes for ghost atoms ==========
+  // When we modify hyb_status for a ghost atom, the real atom on its home
+  // processor doesn't see the change. Gather all changes and apply them.
+
+  int nlocal_changes = hyb_status_changes.size();
+  int ntotal_changes = 0;
+  MPI_Allreduce(&nlocal_changes, &ntotal_changes, 1, MPI_INT, MPI_SUM, world);
+
+  if (ntotal_changes > 0) {
+    // gather counts from all processors
+    std::vector<int> recvcounts(nprocs);
+    MPI_Allgather(&nlocal_changes, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
+
+    // calculate displacements for allgatherv
+    std::vector<int> displs(nprocs);
+    displs[0] = 0;
+    for (int p = 1; p < nprocs; p++) {
+      displs[p] = displs[p-1] + recvcounts[p-1];
+    }
+
+    // pack local changes into flat arrays
+    std::vector<tagint> local_tags(nlocal_changes);
+    std::vector<int> local_deltas(nlocal_changes);
+    for (int c = 0; c < nlocal_changes; c++) {
+      local_tags[c] = hyb_status_changes[c].first;
+      local_deltas[c] = hyb_status_changes[c].second;
+    }
+
+    // gather all changes from all processors
+    std::vector<tagint> all_tags(ntotal_changes);
+    std::vector<int> all_deltas(ntotal_changes);
+
+    MPI_Allgatherv(local_tags.data(), nlocal_changes, MPI_LMP_TAGINT,
+                   all_tags.data(), recvcounts.data(), displs.data(),
+                   MPI_LMP_TAGINT, world);
+    MPI_Allgatherv(local_deltas.data(), nlocal_changes, MPI_INT,
+                   all_deltas.data(), recvcounts.data(), displs.data(),
+                   MPI_INT, world);
+
+    // apply changes to local atoms owned by this processor
+    for (int c = 0; c < ntotal_changes; c++) {
+      int idx = atom->map(all_tags[c]);
+      if (idx >= 0 && idx < nlocal) {
+        hyb_status[idx] += all_deltas[c];
+      }
+    }
   }
 
   // ========== Finalize: aggregate counts and rebuild special lists ==========
@@ -1033,6 +1107,19 @@ void FixDnafoldBondHyb::remove_dummy_bond(int i, int j)
       return;
     }
   }
+}
+
+/* ----------------------------------------------------------------------
+   Check if a bond type is a hybridization bond type (from energy_levels).
+   Returns true if the bond type is in the TYPES section of the complementarity file.
+------------------------------------------------------------------------- */
+
+bool FixDnafoldBondHyb::is_hyb_bond_type(int btype)
+{
+  for (const auto &level : energy_levels) {
+    if (level.second == btype) return true;
+  }
+  return false;
 }
 
 /* ---------------------------------------------------------------------- */

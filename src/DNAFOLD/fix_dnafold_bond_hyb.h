@@ -105,6 +105,7 @@ class FixDnafoldBondHyb : public Fix {
   int get_bond_type(tagint, tagint);
   double get_energy_depth(tagint, tagint);
   void remove_dummy_bond(int, int);
+  bool is_hyb_bond_type(int btype);
 };
 
 }    // namespace LAMMPS_NS

@@ -268,10 +268,12 @@ void FixDnafoldBondPre::read_complementarity_file()
       }
 
       // parse PAIRS section: read complementary atom pairs with per-temperature energies
+      // format: tag1 tag2 <ignored_column> energy1 energy2 ...
       if (current_section == PAIRS) {
         std::istringstream iss(line);
         tagint tag1, tag2;
-        if (!(iss >> tag1 >> tag2)) {
+        std::string ignored_column;
+        if (!(iss >> tag1 >> tag2 >> ignored_column)) {
           error->one(FLERR, fmt::format("Invalid PAIRS format in '{}' at line {}",
                                         complementarity_file, line_num));
         }
