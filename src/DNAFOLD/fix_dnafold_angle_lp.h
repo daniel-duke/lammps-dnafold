@@ -17,51 +17,55 @@
 
 #ifdef FIX_CLASS
 // clang-format off
-FixStyle(dnafold/angle/hyb,FixDnafoldAngleHyb);
+FixStyle(dnafold/angle/lp,FixDnafoldAngleLp);
 // clang-format on
 #else
 
-#ifndef LMP_FIX_DNAFOLD_ANGLE_HYB_H
-#define LMP_FIX_DNAFOLD_ANGLE_HYB_H
+#ifndef LMP_FIX_DNAFOLD_ANGLE_LP_H
+#define LMP_FIX_DNAFOLD_ANGLE_LP_H
 
 #include "fix.h"
+#include <vector>
 
 namespace LAMMPS_NS {
 
-class FixDnafoldAngleHyb : public Fix {
+class FixDnafoldAngleLp : public Fix {
  public:
-  FixDnafoldAngleHyb(class LAMMPS *, int, char **);
-  ~FixDnafoldAngleHyb() override;
+  FixDnafoldAngleLp(class LAMMPS *, int, char **);
+  ~FixDnafoldAngleLp() override;
 
   int setmask() override;
   void init() override;
   void setup(int) override;
   void post_integrate() override;
-  double compute_vector(int) override;
   double memory_usage() override;
 
  private:
   // === MPI info ===
   int me, nprocs;
 
-  // === Property indices ===
-  int hyb_status_index;
-  int is_crossover_index;
-  int size_index;
+  // === Input parameters ===
+  double r12;                      // characteristic length for conversion
+  char *lp_file;                   // persistence length file path
+  char *tvar;                      // temperature variable name (without v_)
+  int tvar_index;                  // temperature variable index
 
-  // === Angle constraint ===
-  double max_angle_deviation;    // maximum deviation from equilibrium angle in degrees
+  // === Persistence length data (from file) ===
+  std::vector<double> temperatures;
+  std::vector<double> persistence_lengths;
+  int num_data_points;
 
-  // === Counters ===
-  // Output vector: [0]=created, [1]=total_created
-  int create_count;
-  bigint create_count_total;
+  // === Angle parameter access ===
+  double *k_angle;                 // pointer to angle K array (from extract)
+
+  // === Constants ===
+  // Boltzmann constant in nano units (pN·nm/K)
+  static constexpr double BOLTZMANN = 0.01380649;
 
   // === Helper functions ===
-  void find_and_create_angles();
-  int has_angle(int, int, int);
-  int are_atoms_bonded(int, int);
-  double compute_angle(int, int, int);  // compute angle j-i-k in degrees
+  void read_lp_file();
+  double get_persistence_length(double T);
+  void update_angle_k();
 };
 
 }    // namespace LAMMPS_NS

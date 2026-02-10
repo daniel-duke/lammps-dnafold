@@ -49,8 +49,8 @@ using namespace FixConst;
 FixDnafoldAngleHyb::FixDnafoldAngleHyb(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg)
 {
-  // syntax: fix ID group dnafold/angle/hyb nevery
-  if (narg != 4) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
+  // syntax: fix ID group dnafold/angle/hyb nevery max_angle_deviation
+  if (narg != 5) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
 
   MPI_Comm_rank(world,&me);
   MPI_Comm_size(world,&nprocs);
@@ -59,7 +59,14 @@ FixDnafoldAngleHyb::FixDnafoldAngleHyb(LAMMPS *lmp, int narg, char **arg) :
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
   if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
 
-  // set up fix flags for output vector
+  // parse max_angle_deviation - maximum deviation from equilibrium angle in degrees
+  max_angle_deviation = utils::numeric(FLERR,arg[4],false,lmp);
+  if (max_angle_deviation <= 0.0 || max_angle_deviation > 90.0)
+    error->all(FLERR,"Illegal max_angle_deviation for fix dnafold/angle/hyb (must be 0 < max_angle_deviation <= 90)");
+
+  // set up fix flags for reneighboring and output vector
+  force_reneighbor = 1;
+  next_reneighbor = update->ntimestep + 1;
   vector_flag = 1;
   size_vector = 2;
   global_freq = 1;
@@ -147,8 +154,8 @@ void FixDnafoldAngleHyb::post_integrate()
   create_count_total += create_count_all;
   create_count = create_count_all;
 
-  // if any angles were created, rebuild special neighbor lists
-  // (angles affect 1-3 special interactions)
+  // if any angles were created, rebuild special neighbor lists and trigger reneighboring
+  // (angles affect 1-3 special interactions and pairwise exclusions)
   if (create_count > 0) {
     // suppress verbose output from Special::build()
     FILE *screen_save = screen;
@@ -162,6 +169,9 @@ void FixDnafoldAngleHyb::post_integrate()
     // restore output streams
     screen = screen_save;
     logfile = logfile_save;
+
+    // trigger neighbor list rebuild to update pairwise exclusions
+    next_reneighbor = update->ntimestep;
   }
 }
 
@@ -254,6 +264,13 @@ void FixDnafoldAngleHyb::find_and_create_angles()
         // skip if angle already exists
         if (has_angle(jlocal, i, klocal)) continue;
 
+        // skip if current angle deviates too much from equilibrium
+        // equilibrium: 180° for type 1 (normal), 90° for type 2 (crossover)
+        double current_angle = compute_angle(jlocal, i, klocal);
+        double equilibrium_angle = (atype == 1) ? 180.0 : 90.0;
+        double deviation = fabs(current_angle - equilibrium_angle);
+        if (deviation > max_angle_deviation) continue;
+
         // create angle j-i-k on center atom i
         if (num_angle[i] >= atom->angle_per_atom)
           error->one(FLERR,"Fix dnafold/angle/hyb: Too many angles per atom");
@@ -315,6 +332,69 @@ int FixDnafoldAngleHyb::has_angle(int i, int j, int k)
   }
 
   return 0;
+}
+
+/* ----------------------------------------------------------------------
+   Compute the angle j-i-k in degrees (i is the center atom).
+   Uses minimum image convention for periodic boundaries.
+------------------------------------------------------------------------- */
+
+double FixDnafoldAngleHyb::compute_angle(int j, int i, int k)
+{
+  double **x = atom->x;
+
+  // vectors from center atom i to end atoms j and k
+  double delx1 = x[j][0] - x[i][0];
+  double dely1 = x[j][1] - x[i][1];
+  double delz1 = x[j][2] - x[i][2];
+
+  double delx2 = x[k][0] - x[i][0];
+  double dely2 = x[k][1] - x[i][1];
+  double delz2 = x[k][2] - x[i][2];
+
+  // apply minimum image convention for vector 1
+  if (domain->xperiodic) {
+    if (delx1 > domain->xprd_half) delx1 -= domain->xprd;
+    else if (delx1 < -domain->xprd_half) delx1 += domain->xprd;
+  }
+  if (domain->yperiodic) {
+    if (dely1 > domain->yprd_half) dely1 -= domain->yprd;
+    else if (dely1 < -domain->yprd_half) dely1 += domain->yprd;
+  }
+  if (domain->zperiodic) {
+    if (delz1 > domain->zprd_half) delz1 -= domain->zprd;
+    else if (delz1 < -domain->zprd_half) delz1 += domain->zprd;
+  }
+
+  // apply minimum image convention for vector 2
+  if (domain->xperiodic) {
+    if (delx2 > domain->xprd_half) delx2 -= domain->xprd;
+    else if (delx2 < -domain->xprd_half) delx2 += domain->xprd;
+  }
+  if (domain->yperiodic) {
+    if (dely2 > domain->yprd_half) dely2 -= domain->yprd;
+    else if (dely2 < -domain->yprd_half) dely2 += domain->yprd;
+  }
+  if (domain->zperiodic) {
+    if (delz2 > domain->zprd_half) delz2 -= domain->zprd;
+    else if (delz2 < -domain->zprd_half) delz2 += domain->zprd;
+  }
+
+  // compute magnitudes
+  double r1 = sqrt(delx1*delx1 + dely1*dely1 + delz1*delz1);
+  double r2 = sqrt(delx2*delx2 + dely2*dely2 + delz2*delz2);
+
+  if (r1 < 1e-10 || r2 < 1e-10) return 0.0;  // degenerate case
+
+  // compute cos(angle) via dot product
+  double cos_angle = (delx1*delx2 + dely1*dely2 + delz1*delz2) / (r1 * r2);
+
+  // clamp to [-1, 1] for numerical safety
+  if (cos_angle > 1.0) cos_angle = 1.0;
+  if (cos_angle < -1.0) cos_angle = -1.0;
+
+  // return angle in degrees
+  return acos(cos_angle) * 180.0 / M_PI;
 }
 
 /* ---------------------------------------------------------------------- */

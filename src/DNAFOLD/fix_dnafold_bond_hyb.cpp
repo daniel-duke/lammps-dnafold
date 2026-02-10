@@ -195,8 +195,8 @@ void FixDnafoldBondHyb::setup(int /* vflag */)
 /* ----------------------------------------------------------------------
    Read complementarity file containing temperature-dependent binding energies.
    File format has three sections:
-   - TEMPERATURES: list of temperature values for interpolation
    - TYPES: bond type to energy depth mapping (determines which bond type to use)
+   - TEMPS: list of temperature values for interpolation
    - PAIRS: atom tag pairs with binding energies at each temperature
 ------------------------------------------------------------------------- */
 
@@ -210,7 +210,7 @@ void FixDnafoldBondHyb::read_complementarity_file()
 
     std::string line;
     int line_num = 0;
-    enum Section { NONE, TEMPERATURES, TYPES, PAIRS };
+    enum Section { NONE, TYPES, TEMPS, PAIRS };
     Section current_section = NONE;
 
     // parse file line by line, handling each section differently
@@ -227,33 +227,18 @@ void FixDnafoldBondHyb::read_complementarity_file()
       std::string trimmed = line.substr(start);
 
       // check for section headers and switch parsing mode
-      if (trimmed == "TEMPERATURES") {
-        current_section = TEMPERATURES;
-        continue;
-      } else if (trimmed == "TYPES") {
+      if (trimmed == "TYPES") {
         current_section = TYPES;
+        continue;
+      } else if (trimmed == "TEMPS") {
+        current_section = TEMPS;
         continue;
       } else if (trimmed == "PAIRS") {
         current_section = PAIRS;
         if (temperatures.empty()) {
-          error->one(FLERR,fmt::format("TEMPERATURES section must appear before PAIRS in '{}'",
+          error->one(FLERR,fmt::format("TEMPS section must appear before PAIRS in '{}'",
                                        complementarity_file));
         }
-        continue;
-      }
-
-      // parse TEMPERATURES section: read list of temperature values
-      if (current_section == TEMPERATURES) {
-        std::istringstream iss(line);
-        double temp;
-        while (iss >> temp) {
-          temperatures.push_back(temp);
-        }
-        if (temperatures.empty()) {
-          error->one(FLERR,fmt::format("Invalid TEMPERATURES format in '{}' at line {}",
-                                       complementarity_file, line_num));
-        }
-        num_temperatures = temperatures.size();
         continue;
       }
 
@@ -276,6 +261,21 @@ void FixDnafoldBondHyb::read_complementarity_file()
 
         // store energy level and bond type pair
         energy_levels.push_back(std::make_pair(energy, btype));
+        continue;
+      }
+
+      // parse TEMPS section: read list of temperature values (in Celsius)
+      if (current_section == TEMPS) {
+        std::istringstream iss(line);
+        double temp;
+        while (iss >> temp) {
+          temperatures.push_back(temp + 273.15);  // convert Celsius to Kelvin
+        }
+        if (temperatures.empty()) {
+          error->one(FLERR,fmt::format("Invalid TEMPS format in '{}' at line {}",
+                                       complementarity_file, line_num));
+        }
+        num_temperatures = temperatures.size();
         continue;
       }
 
@@ -319,7 +319,7 @@ void FixDnafoldBondHyb::read_complementarity_file()
 
     // validate required sections were found
     if (temperatures.empty()) {
-      error->one(FLERR,fmt::format("No TEMPERATURES section found in '{}'", complementarity_file));
+      error->one(FLERR,fmt::format("No TEMPS section found in '{}'", complementarity_file));
     }
 
     if (energy_levels.empty()) {
@@ -338,6 +338,33 @@ void FixDnafoldBondHyb::read_complementarity_file()
               [](const std::pair<double,int> &a, const std::pair<double,int> &b) {
                 return a.first > b.first;  // descending order
               });
+
+    // sort temperatures (ascending) and reorder pair energies to match
+    // this allows temperatures to be listed in any order in the file
+    if (num_temperatures > 1) {
+      // create index array and sort by temperature
+      std::vector<size_t> sort_indices(num_temperatures);
+      for (int i = 0; i < num_temperatures; i++) sort_indices[i] = i;
+
+      std::sort(sort_indices.begin(), sort_indices.end(),
+                [this](size_t a, size_t b) { return temperatures[a] < temperatures[b]; });
+
+      // reorder temperatures
+      std::vector<double> sorted_temps(num_temperatures);
+      for (int i = 0; i < num_temperatures; i++) {
+        sorted_temps[i] = temperatures[sort_indices[i]];
+      }
+      temperatures = std::move(sorted_temps);
+
+      // reorder each pair's energy vector using the same permutation
+      for (auto &entry : complementarity_map) {
+        std::vector<double> sorted_energies(num_temperatures);
+        for (int i = 0; i < num_temperatures; i++) {
+          sorted_energies[i] = entry.second[sort_indices[i]];
+        }
+        entry.second = std::move(sorted_energies);
+      }
+    }
   }
 
   // ========== Broadcast data to all processors ==========
@@ -865,8 +892,12 @@ void FixDnafoldBondHyb::post_integrate()
 
     // map partner tag to local or ghost index
     j = atom->map(partner[i]);
-    if (j < 0)
-      error->one(FLERR,"Fix dnafold/bond/hyb: partner atom not found - ghost cutoff may be too small");
+    if (j < 0) {
+      // partner migrated out of ghost range between selection and creation
+      // this is rare but possible - skip this pair (mutual check would fail anyway)
+      partner[i] = 0;
+      continue;
+    }
 
     // both atoms must agree on being partners (mutual selection)
     if (partner[j] != tag[i]) continue;
