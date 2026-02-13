@@ -154,6 +154,9 @@ void FixDnafoldAngleHyb::post_integrate()
   create_count_total += create_count_all;
   create_count = create_count_all;
 
+  // update global angle counter (required for write_data to output angles)
+  atom->nangles += create_count_all;
+
   // if any angles were created, rebuild special neighbor lists and trigger reneighboring
   // (angles affect 1-3 special interactions and pairwise exclusions)
   if (create_count > 0) {
