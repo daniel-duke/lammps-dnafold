@@ -158,7 +158,6 @@ void FixDnafoldAngleHyb::post_integrate()
   atom->nangles += create_count_all;
 
   // if any angles were created, rebuild special neighbor lists and trigger reneighboring
-  // (angles affect 1-3 special interactions and pairwise exclusions)
   if (create_count > 0) {
     // suppress verbose output from Special::build()
     FILE *screen_save = screen;
@@ -168,12 +167,12 @@ void FixDnafoldAngleHyb::post_integrate()
 
     Special special(lmp);
     special.build();
+    comm->borders();
 
     // restore output streams
     screen = screen_save;
     logfile = logfile_save;
 
-    // trigger neighbor list rebuild to update pairwise exclusions
     next_reneighbor = update->ntimestep;
   }
 }

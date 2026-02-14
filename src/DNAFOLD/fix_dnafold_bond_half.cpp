@@ -196,22 +196,13 @@ void FixDnafoldBondHalf::post_integrate()
 
     Special special(lmp);
     special.build();
+    comm->borders();
 
     // restore output streams
     screen = screen_save;
     logfile = logfile_save;
 
     next_reneighbor = update->ntimestep;
-
-    // log bond changes
-    if (me == 0) {
-      if (screen_save)
-        fprintf(screen_save,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
-                create_count, break_count, update->ntimestep);
-      if (logfile_save)
-        fprintf(logfile_save,"Fix dnafold/bond/half: created %d, broke %d bonds at step " BIGINT_FORMAT "\n",
-                create_count, break_count, update->ntimestep);
-    }
   }
 }
 

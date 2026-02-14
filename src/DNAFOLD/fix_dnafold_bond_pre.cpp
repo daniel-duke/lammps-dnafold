@@ -730,7 +730,9 @@ void FixDnafoldBondPre::post_integrate()
 
     Special special(lmp);
     special.build();
+    comm->borders();
 
+    // restore output streams
     screen = screen_save;
     logfile = logfile_save;
 

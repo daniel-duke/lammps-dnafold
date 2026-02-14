@@ -640,7 +640,34 @@ void FixDnafoldBondHyb::post_integrate()
       jtag = bond_atom[i][ib];
       j = atom->map(jtag);
       if (j < 0) {
-        // partner not found - ghost cutoff may be too small
+        // Debug output to understand why atom map failed
+        if (screen) {
+          fprintf(screen, "DEBUG: timestep=%ld\n", (long)update->ntimestep);
+          fprintf(screen, "DEBUG: atom->map() failed for jtag=%ld\n", (long)jtag);
+          fprintf(screen, "DEBUG: Local atom i: tag=%ld, type=%d, pos=(%g,%g,%g)\n",
+                  (long)itag, itype, xtmp, ytmp, ztmp);
+          fprintf(screen, "DEBUG: Bond index=%d, bond_type=%d\n", ib, bond_type[i][ib]);
+          fprintf(screen, "DEBUG: nlocal=%d, nghost=%d, nall=%d, natoms=%ld\n",
+                  nlocal, atom->nghost, nlocal + atom->nghost, (long)atom->natoms);
+          fprintf(screen, "DEBUG: map_style=%d, nprocs=%d, me=%d\n", atom->map_style, nprocs, me);
+          fprintf(screen, "DEBUG: Searching for jtag in all atoms...\n");
+          bool found = false;
+          for (int k = 0; k < nlocal + atom->nghost; k++) {
+            if (tag[k] == jtag) {
+              fprintf(screen, "DEBUG: Found jtag=%ld at index %d (nlocal=%d, so %s)\n",
+                      (long)jtag, k, nlocal, k < nlocal ? "LOCAL" : "GHOST");
+              found = true;
+            }
+          }
+          if (!found) {
+            fprintf(screen, "DEBUG: jtag=%ld NOT found in any local or ghost atom!\n", (long)jtag);
+          }
+          fprintf(screen, "DEBUG: All bonds on atom i (tag=%ld):\n", (long)itag);
+          for (int b = 0; b < num_bond[i]; b++) {
+            fprintf(screen, "DEBUG:   bond[%d]: partner_tag=%ld, type=%d\n",
+                    b, (long)bond_atom[i][b], bond_type[i][b]);
+          }
+        }
         error->one(FLERR,"Fix dnafold/bond/hyb: Bonded atom not found in ghost atoms. "
                          "Increase communication cutoff with 'comm_modify cutoff'");
       }
@@ -902,12 +929,10 @@ void FixDnafoldBondHyb::post_integrate()
     // both atoms must agree on being partners (mutual selection)
     if (partner[j] != tag[i]) continue;
 
-    // with newton_bond on, only store bond on lower-tagged atom
-    // this prevents duplicate bond creation across processors
+    // with newton_bond on, only store bond on lower-tagged atom to avoid duplicates
     if (tag[i] > tag[j]) continue;
 
-    // DEFENSIVE: Re-validate types before bond creation
-    // This catches any race conditions in MPI communication
+    // Re-validate types before bond creation
     int itype_check = type[i];
     int jtype_check = type[j];
     if (!((itype_check == iatomtype && jtype_check == jatomtype) ||
@@ -915,8 +940,7 @@ void FixDnafoldBondHyb::post_integrate()
       continue;
     }
 
-    // Re-check capacity before creating bond
-    // (partner may have been set in previous timestep when capacity was available)
+    // Re-validate capacity before creating bond
     int min_size_check = (size[i] < size[j]) ? size[i] : size[j];
     if (hyb_status[i] + min_size_check > MAX_HYB_CAPACITY) continue;
     if (hyb_status[j] + min_size_check > MAX_HYB_CAPACITY) continue;
@@ -1018,6 +1042,7 @@ void FixDnafoldBondHyb::post_integrate()
 
     Special special(lmp);
     special.build();
+    comm->borders();
 
     // restore output streams
     screen = screen_save;
