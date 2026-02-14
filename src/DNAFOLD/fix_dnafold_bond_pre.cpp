@@ -463,35 +463,21 @@ bool FixDnafoldBondPre::is_complementary(tagint tag_i, tagint tag_j)
 }
 
 /* ----------------------------------------------------------------------
-   Check if atom i has a dummy bond to atom j.
+   Check if two atoms are directly bonded using the special neighbor list.
+   Returns 1 if bonded (j is in i's 1-2 neighbor list), 0 otherwise.
 ------------------------------------------------------------------------- */
 
-bool FixDnafoldBondPre::has_dummy_bond(int i, int j)
+bool FixDnafoldBondPre::has_bond(int i, int j)
 {
-  int **bond_type = atom->bond_type;
-  tagint **bond_atom = atom->bond_atom;
-  int *num_bond = atom->num_bond;
   tagint jtag = atom->tag[j];
+  tagint *slist = atom->special[i];
+  int n1 = atom->nspecial[i][0];
 
-  for (int k = 0; k < num_bond[i]; k++) {
-    if (bond_atom[i][k] == jtag && bond_type[i][k] == dummy_bond_type) return true;
+  // check if j is in i's 1-2 (directly bonded) neighbor list
+  for (int k = 0; k < n1; k++) {
+    if (slist[k] == jtag) return true;
   }
-  return false;
-}
 
-/* ----------------------------------------------------------------------
-   Check if atom i has any bond (of any type) to atom j.
-------------------------------------------------------------------------- */
-
-bool FixDnafoldBondPre::has_any_bond(int i, int j)
-{
-  tagint **bond_atom = atom->bond_atom;
-  int *num_bond = atom->num_bond;
-  tagint jtag = atom->tag[j];
-
-  for (int k = 0; k < num_bond[i]; k++) {
-    if (bond_atom[i][k] == jtag) return true;
-  }
   return false;
 }
 
@@ -685,7 +671,7 @@ void FixDnafoldBondPre::post_integrate()
       if (!is_complementary(itag, jtag)) continue;
 
       // skip if already bonded (any bond type)
-      if (has_any_bond(i, j)) continue;
+      if (has_bond(i, j)) continue;
 
       // check hybridization capacity constraint
       // min_size is the smaller of the two atoms' sizes (1 for half-bead, 2 for whole)

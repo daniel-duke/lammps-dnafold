@@ -90,8 +90,7 @@ class FixDnafoldBondPre : public Fix {
   void read_complementarity_file();
   double get_interpolated_energy(tagint, tagint);
   bool is_complementary(tagint, tagint);
-  bool has_dummy_bond(int, int);
-  bool has_any_bond(int, int);
+  bool has_bond(int, int);
 };
 
 }    // namespace LAMMPS_NS

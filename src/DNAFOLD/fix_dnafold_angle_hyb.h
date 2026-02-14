@@ -59,8 +59,8 @@ class FixDnafoldAngleHyb : public Fix {
 
   // === Helper functions ===
   void find_and_create_angles();
-  int has_angle(int, int, int);
-  int are_atoms_bonded(int, int);
+  bool has_angle(int, int, int);
+  bool has_bond(int, int);
   double compute_angle(int, int, int);  // compute angle j-i-k in degrees
 };
 

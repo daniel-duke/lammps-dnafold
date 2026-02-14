@@ -157,22 +157,8 @@ void FixDnafoldAngleHyb::post_integrate()
   // update global angle counter (required for write_data to output angles)
   atom->nangles += create_count_all;
 
-  // if any angles were created, rebuild special neighbor lists and trigger reneighboring
+  // if any angles were created, trigger reneighboring
   if (create_count > 0) {
-    // suppress verbose output from Special::build()
-    FILE *screen_save = screen;
-    FILE *logfile_save = logfile;
-    screen = nullptr;
-    logfile = nullptr;
-
-    Special special(lmp);
-    special.build();
-    comm->borders();
-
-    // restore output streams
-    screen = screen_save;
-    logfile = logfile_save;
-
     next_reneighbor = update->ntimestep;
   }
 }
@@ -261,7 +247,7 @@ void FixDnafoldAngleHyb::find_and_create_angles()
         if (jtag == ktag) continue;
 
         // skip if j and k are directly bonded (would form degenerate angle)
-        if (are_atoms_bonded(jlocal, klocal)) continue;
+        if (has_bond(jlocal, klocal)) continue;
 
         // skip if angle already exists
         if (has_angle(jlocal, i, klocal)) continue;
@@ -294,19 +280,18 @@ void FixDnafoldAngleHyb::find_and_create_angles()
    Returns 1 if bonded (j is in i's 1-2 neighbor list), 0 otherwise.
 ------------------------------------------------------------------------- */
 
-int FixDnafoldAngleHyb::are_atoms_bonded(int i, int j)
+bool FixDnafoldAngleHyb::has_bond(int i, int j)
 {
   tagint jtag = atom->tag[j];
   tagint *slist = atom->special[i];
   int n1 = atom->nspecial[i][0];
 
   // check if j is in i's 1-2 (directly bonded) neighbor list
-  // this is globally consistent and handles newton bond storage
   for (int k = 0; k < n1; k++) {
-    if (slist[k] == jtag) return 1;
+    if (slist[k] == jtag) return true;
   }
 
-  return 0;
+  return false;
 }
 
 /* ----------------------------------------------------------------------
@@ -314,7 +299,7 @@ int FixDnafoldAngleHyb::are_atoms_bonded(int i, int j)
    Angles are stored on the center atom, so we only need to check j's list.
 ------------------------------------------------------------------------- */
 
-int FixDnafoldAngleHyb::has_angle(int i, int j, int k)
+bool FixDnafoldAngleHyb::has_angle(int i, int j, int k)
 {
   int *tag = atom->tag;
   int **angle_atom1 = atom->angle_atom1;
@@ -329,11 +314,11 @@ int FixDnafoldAngleHyb::has_angle(int i, int j, int k)
   for (int m = 0; m < num_angle[j]; m++) {
     if ((angle_atom1[j][m] == itag && angle_atom3[j][m] == ktag) ||
         (angle_atom1[j][m] == ktag && angle_atom3[j][m] == itag)) {
-      return 1;
+      return true;
     }
   }
 
-  return 0;
+  return false;
 }
 
 /* ----------------------------------------------------------------------

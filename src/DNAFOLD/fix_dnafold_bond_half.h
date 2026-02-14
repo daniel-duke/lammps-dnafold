@@ -71,7 +71,7 @@ class FixDnafoldBondHalf : public Fix {
   // === Helper functions ===
   void create_same_type_bonds();
   void break_stretched_bonds();
-  int are_atoms_bonded(int, int);
+  bool has_bond(int, int);
 };
 
 }    // namespace LAMMPS_NS

@@ -270,7 +270,7 @@ void FixDnafoldBondHalf::create_same_type_bonds()
         tagint ktag = tag[k];
 
         // skip if j and k are already bonded to each other
-        if (are_atoms_bonded(j, k)) continue;
+        if (has_bond(j, k)) continue;
 
         // calculate distance between j and k with minimum image convention
         double delx = x[j][0] - x[k][0];
@@ -413,11 +413,11 @@ void FixDnafoldBondHalf::break_stretched_bonds()
 }
 
 /* ----------------------------------------------------------------------
-   Check if two atoms are bonded using the special neighbor list.
+   Check if two atoms are directly bonded using the special neighbor list.
    Returns 1 if bonded (j is in i's 1-2 neighbor list), 0 otherwise.
 ------------------------------------------------------------------------- */
 
-int FixDnafoldBondHalf::are_atoms_bonded(int i, int j)
+bool FixDnafoldBondHalf::has_bond(int i, int j)
 {
   tagint jtag = atom->tag[j];
   tagint *slist = atom->special[i];
@@ -425,10 +425,10 @@ int FixDnafoldBondHalf::are_atoms_bonded(int i, int j)
 
   // check if j is in i's 1-2 (directly bonded) neighbor list
   for (int k = 0; k < n1; k++) {
-    if (slist[k] == jtag) return 1;
+    if (slist[k] == jtag) return true;
   }
 
-  return 0;
+  return false;
 }
 
 /* ----------------------------------------------------------------------

@@ -640,34 +640,6 @@ void FixDnafoldBondHyb::post_integrate()
       jtag = bond_atom[i][ib];
       j = atom->map(jtag);
       if (j < 0) {
-        // Debug output to understand why atom map failed
-        if (screen) {
-          fprintf(screen, "DEBUG: timestep=%ld\n", (long)update->ntimestep);
-          fprintf(screen, "DEBUG: atom->map() failed for jtag=%ld\n", (long)jtag);
-          fprintf(screen, "DEBUG: Local atom i: tag=%ld, type=%d, pos=(%g,%g,%g)\n",
-                  (long)itag, itype, xtmp, ytmp, ztmp);
-          fprintf(screen, "DEBUG: Bond index=%d, bond_type=%d\n", ib, bond_type[i][ib]);
-          fprintf(screen, "DEBUG: nlocal=%d, nghost=%d, nall=%d, natoms=%ld\n",
-                  nlocal, atom->nghost, nlocal + atom->nghost, (long)atom->natoms);
-          fprintf(screen, "DEBUG: map_style=%d, nprocs=%d, me=%d\n", atom->map_style, nprocs, me);
-          fprintf(screen, "DEBUG: Searching for jtag in all atoms...\n");
-          bool found = false;
-          for (int k = 0; k < nlocal + atom->nghost; k++) {
-            if (tag[k] == jtag) {
-              fprintf(screen, "DEBUG: Found jtag=%ld at index %d (nlocal=%d, so %s)\n",
-                      (long)jtag, k, nlocal, k < nlocal ? "LOCAL" : "GHOST");
-              found = true;
-            }
-          }
-          if (!found) {
-            fprintf(screen, "DEBUG: jtag=%ld NOT found in any local or ghost atom!\n", (long)jtag);
-          }
-          fprintf(screen, "DEBUG: All bonds on atom i (tag=%ld):\n", (long)itag);
-          for (int b = 0; b < num_bond[i]; b++) {
-            fprintf(screen, "DEBUG:   bond[%d]: partner_tag=%ld, type=%d\n",
-                    b, (long)bond_atom[i][b], bond_type[i][b]);
-          }
-        }
         error->one(FLERR,"Fix dnafold/bond/hyb: Bonded atom not found in ghost atoms. "
                          "Increase communication cutoff with 'comm_modify cutoff'");
       }
@@ -877,7 +849,7 @@ void FixDnafoldBondHyb::post_integrate()
       if (hyb_status[j] + min_size > MAX_HYB_CAPACITY) continue;
 
       // update partner for atom i if this is better
-      // better = lower energy_depth (stronger bond), or same energy but closer distance
+      // better = lower energy depth (stronger bond), or same energy but closer distance
       bool better_for_i = (energy_ij < partner_energy[i]) ||
                           (energy_ij == partner_energy[i] && rsq < dist_sq[i]);
       if (better_for_i) {
@@ -1032,22 +1004,8 @@ void FixDnafoldBondHyb::post_integrate()
   create_count = create_count_all;
   downgrade_count = downgrade_count_all;
 
-  // if any bonds changed, rebuild special neighbor lists and trigger reneighboring
+  // if any bonds changed, trigger reneighboring
   if (create_count || downgrade_count || update_count_all) {
-    // suppress verbose output from Special::build()
-    FILE *screen_save = screen;
-    FILE *logfile_save = logfile;
-    screen = nullptr;
-    logfile = nullptr;
-
-    Special special(lmp);
-    special.build();
-    comm->borders();
-
-    // restore output streams
-    screen = screen_save;
-    logfile = logfile_save;
-
     next_reneighbor = update->ntimestep;
   }
 }
@@ -1123,7 +1081,7 @@ void FixDnafoldBondHyb::unpack_reverse_comm(int n, int *list, double *buf)
     j = list[i];
 
     // compare incoming partner with current partner
-    // keep the better one: lower energy_depth (stronger) or closer distance
+    // keep the better one: lower energy depth (stronger) or closer distance
     double incoming_energy = buf[m+3];
     double incoming_dist_sq = buf[m+2];
 
