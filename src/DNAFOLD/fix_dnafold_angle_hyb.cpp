@@ -39,6 +39,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <utility>
 #include <vector>
 
 using namespace LAMMPS_NS;
@@ -193,6 +195,54 @@ void FixDnafoldAngleHyb::find_and_create_angles()
   tagint **special = atom->special;
   int **nspecial = atom->nspecial;
 
+  // === Build global bond-type lookup via MPI_Allgatherv ===
+  // With newton_bond on, each local atom owns bonds where it is the lower-tagged atom.
+  // Ghost atom bond data is unreliable; use this map for ghost-owned bonds.
+  int *num_bond     = atom->num_bond;
+  int **btype_arr   = atom->bond_type;
+  tagint **batom_arr = atom->bond_atom;
+
+  std::vector<tagint> local_t1, local_t2;
+  std::vector<int>    local_bt;
+  for (int ii = 0; ii < nlocal; ii++) {
+    for (int m = 0; m < num_bond[ii]; m++) {
+      local_t1.push_back(atom->tag[ii]);
+      local_t2.push_back(batom_arr[ii][m]);
+      local_bt.push_back(btype_arr[ii][m]);
+    }
+  }
+
+  int nlocal_bonds = (int)local_t1.size();
+  int ntotal_bonds = 0;
+  MPI_Allreduce(&nlocal_bonds, &ntotal_bonds, 1, MPI_INT, MPI_SUM, world);
+
+  std::map<std::pair<tagint,tagint>, int> bond_type_map;
+
+  if (ntotal_bonds > 0) {
+    std::vector<int> recvcounts(nprocs), displs(nprocs);
+    MPI_Allgather(&nlocal_bonds, 1, MPI_INT,
+                  recvcounts.data(), 1, MPI_INT, world);
+    displs[0] = 0;
+    for (int p = 1; p < nprocs; p++)
+      displs[p] = displs[p-1] + recvcounts[p-1];
+
+    std::vector<tagint> all_t1(ntotal_bonds), all_t2(ntotal_bonds);
+    std::vector<int>    all_bt(ntotal_bonds);
+
+    MPI_Allgatherv(local_t1.data(), nlocal_bonds, MPI_LMP_TAGINT,
+                   all_t1.data(), recvcounts.data(), displs.data(),
+                   MPI_LMP_TAGINT, world);
+    MPI_Allgatherv(local_t2.data(), nlocal_bonds, MPI_LMP_TAGINT,
+                   all_t2.data(), recvcounts.data(), displs.data(),
+                   MPI_LMP_TAGINT, world);
+    MPI_Allgatherv(local_bt.data(), nlocal_bonds, MPI_INT,
+                   all_bt.data(), recvcounts.data(), displs.data(),
+                   MPI_INT, world);
+
+    for (int r = 0; r < ntotal_bonds; r++)
+      bond_type_map[{all_t1[r], all_t2[r]}] = all_bt[r];
+  }
+
   // reset per-step counter
   create_count = 0;
 
@@ -222,11 +272,35 @@ void FixDnafoldAngleHyb::find_and_create_angles()
       tagint ntag = special[i][n];
       int nloc = atom->map(ntag);
 
-      if (nloc < 0) continue;  // neighbor not on this processor
+      if (nloc < 0) continue;  // neighbor not found
       if (!(mask[nloc] & groupbit)) continue;
 
       // neighbor must also be fully hybridized
       if (hyb_status[nloc] != size[nloc]) continue;
+
+      // bond between center atom i and this neighbor must be type 1
+      // lower-tagged atom owns the bond (newton_bond on); use global map for ghost-owned bonds
+      {
+        tagint itag_c = (tagint)tag[i];
+        tagint ntag_c = atom->tag[nloc];
+        tagint lo = (itag_c < ntag_c) ? itag_c : ntag_c;
+        tagint hi = (itag_c < ntag_c) ? ntag_c : itag_c;
+
+        int nloc_lower = atom->map(lo);
+        int btype = -1;
+        if (nloc_lower >= 0 && nloc_lower < nlocal) {
+          // lower atom is local — bond data is reliable
+          for (int m = 0; m < num_bond[nloc_lower]; m++) {
+            if (batom_arr[nloc_lower][m] == hi) { btype = btype_arr[nloc_lower][m]; break; }
+          }
+        } else {
+          // lower atom is a ghost — query the global map
+          auto it = bond_type_map.find({lo, hi});
+          if (it != bond_type_map.end()) btype = it->second;
+        }
+
+        if (btype != 1) continue;
+      }
 
       valid_neighbors.push_back(nloc);
     }

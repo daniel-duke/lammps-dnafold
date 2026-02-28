@@ -40,9 +40,6 @@ class FixDnafoldBondHalf : public Fix {
   double compute_vector(int) override;
   double memory_usage() override;
 
-  int pack_reverse_comm(int, int, double *) override;
-  void unpack_reverse_comm(int, int *, double *) override;
-
  private:
   // === MPI info ===
   int me, nprocs;

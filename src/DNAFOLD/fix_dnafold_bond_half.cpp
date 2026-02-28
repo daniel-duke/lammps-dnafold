@@ -14,11 +14,11 @@
 /* ----------------------------------------------------------------------
    DNAFOLD package: Coarse-grained DNA origami folding simulation
 
-   fix dnafold/bond/half creates and breaks "half-bonds" between
-   same-type half-beads (size=1) that share a common central whole-bead
-   (size=2). These bonds connect half-beads on opposite strands that
-   are each bonded to the same central bead, helping maintain the
-   geometry of partially hybridized regions.
+   fix dnafold/bond/half creates and breaks "half-bonds" between same-
+   type half-beads (size=1) that are both hybridized to a common central
+   central whole-bead (size=2). The bond type passed to the fix to use
+   for the half bonds should apply no forces, since the sole purpose of
+   the bond is to remove pairwise interactions between the half-beads.
 ------------------------------------------------------------------------- */
 
 #include "fix_dnafold_bond_half.h"
@@ -89,9 +89,9 @@ FixDnafoldBondHalf::FixDnafoldBondHalf(LAMMPS *lmp, int narg, char **arg) :
   max_requests = 0;
   num_requests = 0;
 
-  // reverse comm sends 3 values per request: tag1, tag2, bond_type
+  // no per-atom comm needed (bond requests use MPI_Allgatherv)
   comm_forward = 0;
-  comm_reverse = 3;
+  comm_reverse = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -130,7 +130,7 @@ void FixDnafoldBondHalf::init()
   if (force->newton_bond == 0)
     error->all(FLERR,"Fix dnafold/bond/half requires newton bond on");
 
-  // find the size custom property (1 for half-beads, 2 for whole beads)
+  // find the size property
   int flag_size, cols_size;
   size_index = atom->find_custom("size", flag_size, cols_size);
   if (size_index < 0)
@@ -171,9 +171,78 @@ void FixDnafoldBondHalf::post_integrate()
   // phase 2: create new half-bonds between eligible same-type neighbors
   create_same_type_bonds();
 
-  // send bond creation requests to ghost atoms' home processors
-  if (num_requests > 0) {
-    comm->reverse_comm(this);
+  // send bond creation requests to home processors of ghost atoms
+  {
+    int nlocal_requests = num_requests;
+    int ntotal_requests = 0;
+    MPI_Allreduce(&nlocal_requests, &ntotal_requests, 1, MPI_INT, MPI_SUM, world);
+
+    if (ntotal_requests > 0) {
+      // gather request counts from all processors
+      std::vector<int> recvcounts(nprocs);
+      MPI_Allgather(&nlocal_requests, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
+
+      // calculate displacements for allgatherv
+      std::vector<int> displs(nprocs);
+      displs[0] = 0;
+      for (int p = 1; p < nprocs; p++) {
+        displs[p] = displs[p-1] + recvcounts[p-1];
+      }
+
+      // pack local requests into flat arrays
+      std::vector<tagint> local_tag1(nlocal_requests);
+      std::vector<tagint> local_tag2(nlocal_requests);
+      std::vector<int> local_btype(nlocal_requests);
+      for (int r = 0; r < nlocal_requests; r++) {
+        local_tag1[r] = bond_requests[r][0];
+        local_tag2[r] = bond_requests[r][1];
+        local_btype[r] = bond_requests[r][2];
+      }
+
+      // gather all requests from all processors
+      std::vector<tagint> all_tag1(ntotal_requests);
+      std::vector<tagint> all_tag2(ntotal_requests);
+      std::vector<int> all_btype(ntotal_requests);
+
+      MPI_Allgatherv(local_tag1.data(), nlocal_requests, MPI_LMP_TAGINT,
+                     all_tag1.data(), recvcounts.data(), displs.data(),
+                     MPI_LMP_TAGINT, world);
+      MPI_Allgatherv(local_tag2.data(), nlocal_requests, MPI_LMP_TAGINT,
+                     all_tag2.data(), recvcounts.data(), displs.data(),
+                     MPI_LMP_TAGINT, world);
+      MPI_Allgatherv(local_btype.data(), nlocal_requests, MPI_INT,
+                     all_btype.data(), recvcounts.data(), displs.data(),
+                     MPI_INT, world);
+
+      // apply requests: create bonds on local atoms that match tag1
+      int *num_bond = atom->num_bond;
+      tagint **bond_atom = atom->bond_atom;
+      int **bond_type = atom->bond_type;
+
+      for (int r = 0; r < ntotal_requests; r++) {
+        int iloc = atom->map(all_tag1[r]);
+        if (iloc < 0 || iloc >= nlocal) continue;  // not owned by this proc
+
+        // check if this bond already exists (avoid duplicates)
+        bool already_exists = false;
+        for (int kb = 0; kb < num_bond[iloc]; kb++) {
+          if (bond_atom[iloc][kb] == all_tag2[r] && bond_type[iloc][kb] == all_btype[r]) {
+            already_exists = true;
+            break;
+          }
+        }
+        if (already_exists) continue;
+
+        // create the bond
+        if (num_bond[iloc] >= atom->bond_per_atom)
+          error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/half");
+
+        bond_type[iloc][num_bond[iloc]] = all_btype[r];
+        bond_atom[iloc][num_bond[iloc]] = all_tag2[r];
+        num_bond[iloc]++;
+        create_count++;
+      }
+    }
   }
 
   // accumulate counts across all MPI processors
@@ -429,76 +498,6 @@ bool FixDnafoldBondHalf::has_bond(int i, int j)
   }
 
   return false;
-}
-
-/* ----------------------------------------------------------------------
-   Pack bond creation requests for reverse communication.
-   Sends requests to home processors of ghost atoms.
-------------------------------------------------------------------------- */
-
-int FixDnafoldBondHalf::pack_reverse_comm(int n, int first, double *buf)
-{
-  int m = 0;
-
-  // pack all queued bond requests into buffer
-  for (int i = 0; i < num_requests; i++) {
-    buf[m++] = ubuf(bond_requests[i][0]).d;  // tag1 (lower)
-    buf[m++] = ubuf(bond_requests[i][1]).d;  // tag2 (higher)
-    buf[m++] = ubuf(bond_requests[i][2]).d;  // bond type
-  }
-
-  return m;
-}
-
-/* ----------------------------------------------------------------------
-   Unpack bond creation requests from reverse communication.
-   Creates bonds on local atoms that were requested by other processors.
-------------------------------------------------------------------------- */
-
-void FixDnafoldBondHalf::unpack_reverse_comm(int n, int *list, double *buf)
-{
-  int m = 0;
-  tagint *tag = atom->tag;
-  int *num_bond = atom->num_bond;
-  tagint **bond_atom = atom->bond_atom;
-  int **bond_type = atom->bond_type;
-  int nlocal = atom->nlocal;
-
-  // number of bond requests received
-  int num_recv = n / 3;
-
-  // process each received bond creation request
-  for (int i = 0; i < num_recv; i++) {
-    tagint tag1 = (tagint) ubuf(buf[m++]).i;
-    tagint tag2 = (tagint) ubuf(buf[m++]).i;
-    int btype = (int) ubuf(buf[m++]).i;
-
-    // find local atom with tag1 (should be local since request was sent here)
-    int iloc = atom->map(tag1);
-
-    // safety check: must be a local atom
-    if (iloc < 0 || iloc >= nlocal) continue;
-
-    // check if this bond already exists (avoid duplicates)
-    int already_exists = 0;
-    for (int k = 0; k < num_bond[iloc]; k++) {
-      if (bond_atom[iloc][k] == tag2 && bond_type[iloc][k] == btype) {
-        already_exists = 1;
-        break;
-      }
-    }
-
-    if (already_exists) continue;
-
-    // create the bond
-    if (num_bond[iloc] >= atom->bond_per_atom)
-      error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/half");
-
-    bond_type[iloc][num_bond[iloc]] = btype;
-    bond_atom[iloc][num_bond[iloc]] = tag2;
-    num_bond[iloc]++;
-    create_count++;
-  }
 }
 
 /* ---------------------------------------------------------------------- */

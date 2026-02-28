@@ -736,6 +736,7 @@ void FixDnafoldBondHyb::post_integrate()
   }
 
   // remove angles involving any downgraded type 1 atoms
+  int local_angles_removed = 0;
   if (ntotal_downgraded > 0) {
     int **angle_type = atom->angle_type;
     tagint **angle_atom1 = atom->angle_atom1;
@@ -768,12 +769,20 @@ void FixDnafoldBondHyb::post_integrate()
             angle_atom3[i][k] = angle_atom3[i][k+1];
           }
           num_angle[i]--;
+          local_angles_removed++;
           // don't increment ia since we shifted
         } else {
           ia++;
         }
       }
     }
+  }
+
+  // update global angle counter to reflect removed angles
+  {
+    int total_angles_removed = 0;
+    MPI_Allreduce(&local_angles_removed, &total_angles_removed, 1, MPI_INT, MPI_SUM, world);
+    atom->nangles -= total_angles_removed;
   }
 
   // ========== SECOND PASS: Upgrade dummy bonds to hyb bonds ==========
