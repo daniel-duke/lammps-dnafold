@@ -66,8 +66,8 @@ class FixDnafoldBondHalf : public Fix {
   tagint **bond_requests;
 
   // === Helper functions ===
-  void create_same_type_bonds();
-  void break_stretched_bonds();
+  void remove_bonds();
+  void create_bonds();
   bool has_bond(int, int);
 };
 

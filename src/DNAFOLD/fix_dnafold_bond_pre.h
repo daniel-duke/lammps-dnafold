@@ -87,6 +87,8 @@ class FixDnafoldBondPre : public Fix {
   class NeighList *list;
 
   // === Helper functions ===
+  void remove_bonds();
+  void create_bonds();
   void read_complementarity_file();
   double get_interpolated_energy(tagint, tagint);
   bool is_complementary(tagint, tagint);

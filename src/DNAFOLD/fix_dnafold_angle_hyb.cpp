@@ -148,7 +148,7 @@ void FixDnafoldAngleHyb::post_integrate()
   if (update->ntimestep % nevery) return;
 
   // find and create angles for fully hybridized triplets
-  find_and_create_angles();
+  create_angles();
 
   // accumulate counts across all MPI processors
   int create_count_all;
@@ -174,7 +174,7 @@ void FixDnafoldAngleHyb::post_integrate()
    - The angle doesn't already exist
 ------------------------------------------------------------------------- */
 
-void FixDnafoldAngleHyb::find_and_create_angles()
+void FixDnafoldAngleHyb::create_angles()
 {
   int i,j,k;
   int nlocal = atom->nlocal;

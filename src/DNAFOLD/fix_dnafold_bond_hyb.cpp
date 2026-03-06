@@ -547,22 +547,13 @@ double FixDnafoldBondHyb::get_energy_depth(tagint tag_i, tagint tag_j)
 
 /* ----------------------------------------------------------------------
    Main function called every nevery timesteps.
-   Two passes:
-   (1) Check existing hyb bonds - downgrade if stretched or energy dropped
-   (2) Upgrade dummy bonds to hyb bonds for close complementary pairs
+   Delegates to downgrade_bonds() and upgrade_bonds(), broadcasts
+   hyb_status changes, then aggregates counts and triggers reneighboring.
 ------------------------------------------------------------------------- */
 
 void FixDnafoldBondHyb::post_integrate()
 {
-  int i,j,m;
-  double xtmp,ytmp,ztmp,delx,dely,delz,rsq;
-  int itype, jtype, btype_ij;
-  tagint itag, jtag;
-
   if (update->ntimestep % nevery) return;
-
-  int *hyb_status = atom->ivector[hyb_status_index];
-  int *size = atom->ivector[size_index];
 
   // acquire updated ghost atom positions and properties
   comm->forward_comm();
@@ -582,19 +573,9 @@ void FixDnafoldBondHyb::post_integrate()
     memory->create(partner_energy, nmax, "dnafold/bond/hyb:partner_energy");
   }
 
-  // get atom data pointers
-  int nlocal = atom->nlocal;
-  int nall = atom->nlocal + atom->nghost;
-  double **x = atom->x;
-  tagint *tag = atom->tag;
-  int *mask = atom->mask;
-  int *type = atom->type;
-  int **bond_type = atom->bond_type;
-  tagint **bond_atom = atom->bond_atom;
-  int *num_bond = atom->num_bond;
-
   // initialize partner arrays for all atoms (local + ghost)
-  for (i = 0; i < nall; i++) {
+  int nall = atom->nlocal + atom->nghost;
+  for (int i = 0; i < nall; i++) {
     partner[i] = 0;
     final_partner[i] = 0;
     partner_bond_type[i] = 0;
@@ -602,30 +583,74 @@ void FixDnafoldBondHyb::post_integrate()
     partner_energy[i] = BIG;
   }
 
-  // ========== FIRST PASS: Check existing hyb bonds ==========
-  // Downgrade to dummy if:
-  // - Distance exceeds cutoff
-  // - Energy dropped below threshold at current temperature
-  // Update bond type if energy changed to different level
+  // clear shared state for this timestep
+  hyb_status_changes.clear();
+  create_count = 0;
+  downgrade_count = 0;
+  update_count = 0;
 
-  int local_downgrade_count = 0;
-  int update_count = 0;
-  std::vector<tagint> downgraded_type1_tags;  // track type 1 atoms for angle removal
-  std::vector<std::pair<tagint, int>> hyb_status_changes;  // track (tag, delta) for ghost atoms
+  // phase 1: downgrade hyb bonds that no longer meet criteria, remove associated angles
+  downgrade_bonds();
 
-  for (i = 0; i < nlocal; i++) {
+  // phase 2: upgrade dummy bonds to hyb bonds for close complementary pairs
+  upgrade_bonds();
+
+  // broadcast hyb_status changes (from both phases) to ghost atoms' home processors
+  broadcast_hyb_status_changes();
+
+  // accumulate counts across all MPI processors
+  int create_count_all, downgrade_count_all, update_count_all;
+  MPI_Allreduce(&create_count, &create_count_all, 1, MPI_INT, MPI_SUM, world);
+  MPI_Allreduce(&downgrade_count, &downgrade_count_all, 1, MPI_INT, MPI_SUM, world);
+  MPI_Allreduce(&update_count, &update_count_all, 1, MPI_INT, MPI_SUM, world);
+  create_count_total += create_count_all;
+  downgrade_count_total += downgrade_count_all;
+  create_count = create_count_all;
+  downgrade_count = downgrade_count_all;
+
+  // if any bonds changed, trigger reneighboring
+  if (create_count || downgrade_count || update_count_all) {
+    next_reneighbor = update->ntimestep;
+  }
+}
+
+/* ----------------------------------------------------------------------
+   Downgrade hyb bonds that no longer meet validity criteria.
+   A hyb bond is downgraded to dummy if:
+   - Distance exceeds cutoff
+   - Energy dropped below threshold at current temperature
+   Also updates bond type in-place if energy changed to a different level.
+   Removes angles associated with any downgraded type 1 atoms.
+------------------------------------------------------------------------- */
+
+void FixDnafoldBondHyb::downgrade_bonds()
+{
+  int nlocal = atom->nlocal;
+  double **x = atom->x;
+  tagint *tag = atom->tag;
+  int *mask = atom->mask;
+  int *type = atom->type;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+  int *hyb_status = atom->ivector[hyb_status_index];
+  int *size = atom->ivector[size_index];
+
+  std::vector<tagint> downgraded_type1_tags;  // type 1 atoms with downgraded bonds
+
+  for (int i = 0; i < nlocal; i++) {
     if (!(mask[i] & groupbit)) continue;
 
-    itype = type[i];
+    int itype = type[i];
     if (itype != iatomtype && itype != jatomtype) continue;
 
     // skip atoms with no hybridized bonds
     if (hyb_status[i] == 0) continue;
 
-    itag = tag[i];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
+    tagint itag = tag[i];
+    double xtmp = x[i][0];
+    double ytmp = x[i][1];
+    double ztmp = x[i][2];
 
     // loop through i's bonds looking for hyb bonds
     int ib = 0;
@@ -637,17 +662,17 @@ void FixDnafoldBondHyb::post_integrate()
       }
 
       // this is a hyb bond - get partner info
-      jtag = bond_atom[i][ib];
-      j = atom->map(jtag);
+      tagint jtag = bond_atom[i][ib];
+      int j = atom->map(jtag);
       if (j < 0) {
         error->one(FLERR,"Fix dnafold/bond/hyb: Bonded atom not found in ghost atoms. "
                          "Increase communication cutoff with 'comm_modify cutoff'");
       }
 
       // calculate distance with minimum image convention
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
+      double delx = xtmp - x[j][0];
+      double dely = ytmp - x[j][1];
+      double delz = ztmp - x[j][2];
       if (domain->xperiodic) {
         if (delx > domain->xprd_half) delx -= domain->xprd;
         else if (delx < -domain->xprd_half) delx += domain->xprd;
@@ -660,27 +685,19 @@ void FixDnafoldBondHyb::post_integrate()
         if (delz > domain->zprd_half) delz -= domain->zprd;
         else if (delz < -domain->zprd_half) delz += domain->zprd;
       }
-      rsq = delx*delx + dely*dely + delz*delz;
+      double rsq = delx*delx + dely*dely + delz*delz;
 
       // get the correct bond type at current temperature
       int correct_btype = get_bond_type(itag, jtag);
 
       // determine action: downgrade to dummy, update bond type, or keep as-is
-      bool should_downgrade = false;
-
-      if (rsq > cutoff_sq) {
-        // too far - downgrade to dummy
-        should_downgrade = true;
-      } else if (correct_btype == 0) {
-        // energy dropped below threshold at current T - downgrade to dummy
-        should_downgrade = true;
-      }
+      bool should_downgrade = (rsq > cutoff_sq) || (correct_btype == 0);
 
       if (should_downgrade) {
         // downgrade to dummy bond
         bond_type[i][ib] = dummy_bond_type;
 
-        // calculate min_size and subtract from hyb_status for both atoms
+        // subtract min_size from hyb_status for both atoms
         int min_size = (size[i] < size[j]) ? size[i] : size[j];
         hyb_status[i] -= min_size;
 
@@ -696,46 +713,42 @@ void FixDnafoldBondHyb::post_integrate()
           downgraded_type1_tags.push_back(itag);
         }
 
-        local_downgrade_count++;
+        downgrade_count++;
       } else if (bond_type[i][ib] != correct_btype) {
-        // bond type changed due to temperature - update it
+        // bond type changed due to temperature - update in-place
         bond_type[i][ib] = correct_btype;
         update_count++;
-        // hyb_status doesn't change since it's still a hyb bond
       }
 
       ib++;
     }
   }
 
-  // ========== Remove angles involving downgraded type 1 atoms ==========
-  // Gather all downgraded type 1 tags across processors
+  // === Remove angles involving downgraded type 1 atoms ===
+  // Gather downgraded type 1 tags across all processors
 
-  int nlocal_downgraded = downgraded_type1_tags.size();
+  int nlocal_downgraded = (int)downgraded_type1_tags.size();
   int ntotal_downgraded = 0;
   MPI_Allreduce(&nlocal_downgraded, &ntotal_downgraded, 1, MPI_INT, MPI_SUM, world);
 
   std::vector<tagint> all_downgraded_type1_tags;
   if (ntotal_downgraded > 0) {
-    // gather counts from all processors
     std::vector<int> recvcounts(nprocs);
     MPI_Allgather(&nlocal_downgraded, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
 
-    // calculate displacements for allgatherv
     std::vector<int> displs(nprocs);
     displs[0] = 0;
     for (int p = 1; p < nprocs; p++) {
       displs[p] = displs[p-1] + recvcounts[p-1];
     }
 
-    // gather all tags
     all_downgraded_type1_tags.resize(ntotal_downgraded);
     MPI_Allgatherv(downgraded_type1_tags.data(), nlocal_downgraded, MPI_LMP_TAGINT,
                    all_downgraded_type1_tags.data(), recvcounts.data(), displs.data(),
                    MPI_LMP_TAGINT, world);
   }
 
-  // remove angles involving any downgraded type 1 atoms
+  // remove angles where any atom matches a downgraded type 1 atom
   int local_angles_removed = 0;
   if (ntotal_downgraded > 0) {
     int **angle_type = atom->angle_type;
@@ -744,13 +757,11 @@ void FixDnafoldBondHyb::post_integrate()
     tagint **angle_atom3 = atom->angle_atom3;
     int *num_angle = atom->num_angle;
 
-    // loop through all local atoms' angles
-    for (i = 0; i < nlocal; i++) {
+    for (int i = 0; i < nlocal; i++) {
       int ia = 0;
       while (ia < num_angle[i]) {
         bool should_remove = false;
 
-        // check if any of the three atoms in this angle match a downgraded type 1 atom
         for (tagint downgraded_tag : all_downgraded_type1_tags) {
           if (angle_atom1[i][ia] == downgraded_tag ||
               angle_atom2[i][ia] == downgraded_tag ||
@@ -761,7 +772,6 @@ void FixDnafoldBondHyb::post_integrate()
         }
 
         if (should_remove) {
-          // remove angle by shifting remaining angles down
           for (int k = ia; k < num_angle[i] - 1; k++) {
             angle_type[i][k] = angle_type[i][k+1];
             angle_atom1[i][k] = angle_atom1[i][k+1];
@@ -770,7 +780,6 @@ void FixDnafoldBondHyb::post_integrate()
           }
           num_angle[i]--;
           local_angles_removed++;
-          // don't increment ia since we shifted
         } else {
           ia++;
         }
@@ -779,56 +788,68 @@ void FixDnafoldBondHyb::post_integrate()
   }
 
   // update global angle counter to reflect removed angles
-  {
-    int total_angles_removed = 0;
-    MPI_Allreduce(&local_angles_removed, &total_angles_removed, 1, MPI_INT, MPI_SUM, world);
-    atom->nangles -= total_angles_removed;
-  }
+  int total_angles_removed = 0;
+  MPI_Allreduce(&local_angles_removed, &total_angles_removed, 1, MPI_INT, MPI_SUM, world);
+  atom->nangles -= total_angles_removed;
+}
 
-  // ========== SECOND PASS: Upgrade dummy bonds to hyb bonds ==========
-  // Find the best partner (closest distance with strongest binding) for each atom
+/* ----------------------------------------------------------------------
+   Upgrade dummy bonds to hyb bonds for close complementary atom pairs.
+   Uses mutual partner selection: each atom picks its best candidate,
+   then reverse/forward comm resolves ghost selections, and bonds are
+   only created when both atoms mutually agree on each other as partners.
+------------------------------------------------------------------------- */
 
-  for (i = 0; i < nlocal; i++) {
+void FixDnafoldBondHyb::upgrade_bonds()
+{
+  int nlocal = atom->nlocal;
+  double **x = atom->x;
+  tagint *tag = atom->tag;
+  int *mask = atom->mask;
+  int *type = atom->type;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+  int *hyb_status = atom->ivector[hyb_status_index];
+  int *size = atom->ivector[size_index];
 
+  // === Find best partner candidates via dummy bonds ===
+
+  for (int i = 0; i < nlocal; i++) {
     if (!(mask[i] & groupbit)) continue;
 
     // skip if atom i already at full hybridization capacity
     if (hyb_status[i] >= MAX_HYB_CAPACITY) continue;
 
     // atom i must be type 1 or type 2
-    itype = type[i];
+    int itype = type[i];
     if (itype != iatomtype && itype != jatomtype) continue;
 
-    itag = tag[i];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
+    tagint itag = tag[i];
+    double xtmp = x[i][0];
+    double ytmp = x[i][1];
+    double ztmp = x[i][2];
 
     // loop through i's bonds looking for dummy bonds to upgrade
     for (int k = 0; k < num_bond[i]; k++) {
-      // skip if not a dummy bond
       if (bond_type[i][k] != dummy_bond_type) continue;
 
-      // get partner atom
-      jtag = bond_atom[i][k];
-      j = atom->map(jtag);
+      tagint jtag = bond_atom[i][k];
+      int j = atom->map(jtag);
 
-      if (j < 0) continue;  // partner not found
-
+      if (j < 0) continue;
       if (!(mask[j] & groupbit)) continue;
-
-      // skip if atom j already at full hybridization capacity
       if (hyb_status[j] >= MAX_HYB_CAPACITY) continue;
 
       // atom j must be the opposite type from i
-      jtype = type[j];
+      int jtype = type[j];
       if (itype == iatomtype && jtype != jatomtype) continue;
       if (itype == jatomtype && jtype != iatomtype) continue;
 
       // calculate distance with minimum image convention
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
+      double delx = xtmp - x[j][0];
+      double dely = ytmp - x[j][1];
+      double delz = ztmp - x[j][2];
       if (domain->xperiodic) {
         if (delx > domain->xprd_half) delx -= domain->xprd;
         else if (delx < -domain->xprd_half) delx += domain->xprd;
@@ -841,24 +862,21 @@ void FixDnafoldBondHyb::post_integrate()
         if (delz > domain->zprd_half) delz -= domain->zprd;
         else if (delz < -domain->zprd_half) delz += domain->zprd;
       }
-      rsq = delx*delx + dely*dely + delz*delz;
+      double rsq = delx*delx + dely*dely + delz*delz;
 
-      // skip if beyond cutoff distance
       if (rsq > cutoff_sq) continue;
 
-      // check if this pair is complementary and get bond type
-      btype_ij = get_bond_type(itag, jtag);
-      if (btype_ij == 0) continue;  // not complementary
+      int btype_ij = get_bond_type(itag, jtag);
+      if (btype_ij == 0) continue;
 
       double energy_ij = get_energy_depth(itag, jtag);
 
-      // check hybridization capacity constraint
       int min_size = (size[i] < size[j]) ? size[i] : size[j];
       if (hyb_status[i] + min_size > MAX_HYB_CAPACITY) continue;
       if (hyb_status[j] + min_size > MAX_HYB_CAPACITY) continue;
 
-      // update partner for atom i if this is better
-      // better = lower energy depth (stronger bond), or same energy but closer distance
+      // update partner for atom i if this candidate is better
+      // better = stronger bond (lower energy depth), or same strength but closer
       bool better_for_i = (energy_ij < partner_energy[i]) ||
                           (energy_ij == partner_energy[i] && rsq < dist_sq[i]);
       if (better_for_i) {
@@ -868,8 +886,8 @@ void FixDnafoldBondHyb::post_integrate()
         partner_energy[i] = energy_ij;
       }
 
-      // update partner for atom j if this is better
-      // this is safe even if j is a ghost - we'll communicate this back
+      // update partner for atom j if this candidate is better
+      // safe even if j is ghost - reverse comm will reconcile to home processor
       bool better_for_j = (energy_ij < partner_energy[j]) ||
                           (energy_ij == partner_energy[j] && rsq < dist_sq[j]);
       if (better_for_j) {
@@ -881,39 +899,35 @@ void FixDnafoldBondHyb::post_integrate()
     }
   }
 
-  // reverse comm: send ghost atom partner data back to home processors
-  // home processor keeps the best (closest/strongest) partner
+  // reverse comm: send ghost atom partner selections back to home processors
+  // home processor keeps the best (strongest bond or closest distance)
   commflag = 1;
   if (force->newton_pair) comm->reverse_comm(this);
 
-  // forward comm: send finalized partner data to ghosts
-  // ensures all atoms know about confirmed partners
+  // forward comm: send finalized partner data to ghost atoms
+  // ensures all atoms know about confirmed partners before bond creation
   commflag = 1;
   comm->forward_comm(this);
 
-  // ========== Create bonds for mutual partners ==========
-  // Only create bond if both atoms chose each other as partners
+  // === Create bonds for mutually selected partners ===
 
-  int local_create_count = 0;
-  for (i = 0; i < nlocal; i++) {
+  for (int i = 0; i < nlocal; i++) {
     if (partner[i] == 0) continue;
 
-    // map partner tag to local or ghost index
-    j = atom->map(partner[i]);
+    int j = atom->map(partner[i]);
     if (j < 0) {
-      // partner migrated out of ghost range between selection and creation
-      // this is rare but possible - skip this pair (mutual check would fail anyway)
+      // partner migrated out of ghost range - skip (mutual check would fail anyway)
       partner[i] = 0;
       continue;
     }
 
-    // both atoms must agree on being partners (mutual selection)
+    // both atoms must have chosen each other (mutual selection)
     if (partner[j] != tag[i]) continue;
 
-    // with newton_bond on, only store bond on lower-tagged atom to avoid duplicates
+    // with newton_bond on, only store bond on lower-tagged atom
     if (tag[i] > tag[j]) continue;
 
-    // Re-validate types before bond creation
+    // re-validate types before bond creation
     int itype_check = type[i];
     int jtype_check = type[j];
     if (!((itype_check == iatomtype && jtype_check == jatomtype) ||
@@ -921,7 +935,7 @@ void FixDnafoldBondHyb::post_integrate()
       continue;
     }
 
-    // Re-validate capacity before creating bond
+    // re-validate capacity before creating bond
     int min_size_check = (size[i] < size[j]) ? size[i] : size[j];
     if (hyb_status[i] + min_size_check > MAX_HYB_CAPACITY) continue;
     if (hyb_status[j] + min_size_check > MAX_HYB_CAPACITY) continue;
@@ -929,15 +943,13 @@ void FixDnafoldBondHyb::post_integrate()
     if (num_bond[i] >= atom->bond_per_atom)
       error->one(FLERR,"Too many bonds per atom in fix dnafold/bond/hyb");
 
-    // create the hybridization bond with appropriate bond type
+    // create the hybridization bond (replaces the dummy bond)
     bond_type[i][num_bond[i]] = partner_bond_type[i];
     bond_atom[i][num_bond[i]] = tag[j];
     num_bond[i]++;
-
-    // remove the dummy bond between i and j (it's being replaced)
     remove_dummy_bond(i, j);
 
-    // calculate min_size and add to hyb_status for both atoms
+    // add min_size to hyb_status for both atoms
     int min_size = (size[i] < size[j]) ? size[i] : size[j];
     hyb_status[i] += min_size;
 
@@ -948,26 +960,31 @@ void FixDnafoldBondHyb::post_integrate()
       hyb_status_changes.push_back(std::make_pair(tag[j], min_size));
     }
 
-    // store final partners for bookkeeping
     final_partner[i] = tag[j];
-
-    local_create_count++;
+    create_count++;
   }
+}
 
-  // ========== Broadcast hyb_status changes for ghost atoms ==========
-  // When we modify hyb_status for a ghost atom, the real atom on its home
-  // processor doesn't see the change. Gather all changes and apply them.
+/* ----------------------------------------------------------------------
+   Broadcast hyb_status changes for ghost atoms to their home processors.
+   Both downgrade_bonds() and upgrade_bonds() may modify hyb_status for
+   ghost atoms; those changes are invisible to the ghost's home processor
+   until this broadcast applies them.
+------------------------------------------------------------------------- */
 
-  int nlocal_changes = hyb_status_changes.size();
+void FixDnafoldBondHyb::broadcast_hyb_status_changes()
+{
+  int *hyb_status = atom->ivector[hyb_status_index];
+  int nlocal = atom->nlocal;
+
+  int nlocal_changes = (int)hyb_status_changes.size();
   int ntotal_changes = 0;
   MPI_Allreduce(&nlocal_changes, &ntotal_changes, 1, MPI_INT, MPI_SUM, world);
 
   if (ntotal_changes > 0) {
-    // gather counts from all processors
     std::vector<int> recvcounts(nprocs);
     MPI_Allgather(&nlocal_changes, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
 
-    // calculate displacements for allgatherv
     std::vector<int> displs(nprocs);
     displs[0] = 0;
     for (int p = 1; p < nprocs; p++) {
@@ -993,29 +1010,13 @@ void FixDnafoldBondHyb::post_integrate()
                    all_deltas.data(), recvcounts.data(), displs.data(),
                    MPI_INT, world);
 
-    // apply changes to local atoms owned by this processor
+    // apply changes to atoms owned by this processor
     for (int c = 0; c < ntotal_changes; c++) {
       int idx = atom->map(all_tags[c]);
       if (idx >= 0 && idx < nlocal) {
         hyb_status[idx] += all_deltas[c];
       }
     }
-  }
-
-  // ========== Finalize: aggregate counts and rebuild special lists ==========
-
-  int create_count_all, downgrade_count_all, update_count_all;
-  MPI_Allreduce(&local_create_count,&create_count_all,1,MPI_INT,MPI_SUM,world);
-  MPI_Allreduce(&local_downgrade_count,&downgrade_count_all,1,MPI_INT,MPI_SUM,world);
-  MPI_Allreduce(&update_count,&update_count_all,1,MPI_INT,MPI_SUM,world);
-  create_count_total += create_count_all;
-  downgrade_count_total += downgrade_count_all;
-  create_count = create_count_all;
-  downgrade_count = downgrade_count_all;
-
-  // if any bonds changed, trigger reneighboring
-  if (create_count || downgrade_count || update_count_all) {
-    next_reneighbor = update->ntimestep;
   }
 }
 

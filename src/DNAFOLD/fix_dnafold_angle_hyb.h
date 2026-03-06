@@ -50,7 +50,7 @@ class FixDnafoldAngleHyb : public Fix {
   int size_index;
 
   // === Angle constraint ===
-  double max_angle_deviation;    // maximum deviation from equilibrium angle in degrees
+  double max_angle_deviation;
 
   // === Counters ===
   // Output vector: [0]=created, [1]=total_created
@@ -58,10 +58,10 @@ class FixDnafoldAngleHyb : public Fix {
   bigint create_count_total;
 
   // === Helper functions ===
-  void find_and_create_angles();
+  void create_angles();
   bool has_angle(int, int, int);
   bool has_bond(int, int);
-  double compute_angle(int, int, int);  // compute angle j-i-k in degrees
+  double compute_angle(int, int, int);
 };
 
 }    // namespace LAMMPS_NS

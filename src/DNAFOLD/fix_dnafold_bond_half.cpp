@@ -165,11 +165,11 @@ void FixDnafoldBondHalf::post_integrate()
   break_count = 0;
   num_requests = 0;
 
-  // phase 1: break half-bonds that have stretched beyond cutoff
-  break_stretched_bonds();
+  // phase 1: remove half-bonds that have stretched beyond cutoff
+  remove_bonds();
 
   // phase 2: create new half-bonds between eligible same-type neighbors
-  create_same_type_bonds();
+  create_bonds();
 
   // send bond creation requests to home processors of ghost atoms
   {
@@ -281,7 +281,7 @@ void FixDnafoldBondHalf::post_integrate()
    pairs of opposite-type neighbors (relative to center) with size=1.
 ------------------------------------------------------------------------- */
 
-void FixDnafoldBondHalf::create_same_type_bonds()
+void FixDnafoldBondHalf::create_bonds()
 {
   int nlocal = atom->nlocal;
   int *type = atom->type;
@@ -400,7 +400,7 @@ void FixDnafoldBondHalf::create_same_type_bonds()
    Only processes bonds of type half_bond_type between half-beads.
 ------------------------------------------------------------------------- */
 
-void FixDnafoldBondHalf::break_stretched_bonds()
+void FixDnafoldBondHalf::remove_bonds()
 {
   int nlocal = atom->nlocal;
   double **x = atom->x;

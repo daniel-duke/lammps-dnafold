@@ -88,6 +88,7 @@ class FixDnafoldBondHyb : public Fix {
   // === Counters ===
   // Output vector: [0]=created, [1]=total_created, [2]=downgraded, [3]=total_downgraded
   int create_count, downgrade_count;
+  int update_count;    // bond type updates due to temperature change (not in output vector)
   bigint create_count_total, downgrade_count_total;
 
   // === Communication arrays ===
@@ -99,7 +100,15 @@ class FixDnafoldBondHyb : public Fix {
   double *partner_energy;
   int commflag;
 
+  // === Per-timestep shared state ===
+  // Accumulates hyb_status changes for ghost atoms across both phases;
+  // broadcast to home processors via MPI_Allgatherv after all phases complete.
+  std::vector<std::pair<tagint,int>> hyb_status_changes;
+
   // === Helper functions ===
+  void downgrade_bonds();
+  void upgrade_bonds();
+  void broadcast_hyb_status_changes();
   void read_complementarity_file();
   double get_interpolated_energy(tagint, tagint);
   int get_bond_type(tagint, tagint);

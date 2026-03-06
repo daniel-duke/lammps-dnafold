@@ -483,218 +483,27 @@ bool FixDnafoldBondPre::has_bond(int i, int j)
 
 /* ----------------------------------------------------------------------
    Main function called every nevery timesteps.
-   Two passes: (1) remove invalid dummy bonds, (2) create new dummy bonds.
+   Delegates to remove_bonds() and create_bonds(), then
+   aggregates counts and conditionally rebuilds special lists.
 ------------------------------------------------------------------------- */
 
 void FixDnafoldBondPre::post_integrate()
 {
-  int i, j, ii, jj, inum, jnum, k;
-  int *ilist, *jlist, *numneigh, **firstneigh;
-  double xtmp, ytmp, ztmp, delx, dely, delz, rsq;
-  int itype, jtype;
-  tagint itag, jtag;
-
   if (update->ntimestep % nevery) return;
 
   // acquire updated ghost atom positions and rebuild occasional neighbor list
   comm->forward_comm();
   neighbor->build_one(list);
 
-  // get neighbor list data
-  inum = list->inum;
-  ilist = list->ilist;
-  numneigh = list->numneigh;
-  firstneigh = list->firstneigh;
-
-  // get atom data pointers
-  int nlocal = atom->nlocal;
-  double **x = atom->x;
-  tagint *tag = atom->tag;
-  int *mask = atom->mask;
-  int *type = atom->type;
-  int **bond_type = atom->bond_type;
-  tagint **bond_atom = atom->bond_atom;
-  int *num_bond = atom->num_bond;
-
   // reset per-step counters
   create_count = 0;
   remove_count = 0;
 
-  // ========== FIRST PASS: Remove dummy bonds that should no longer exist ==========
-  // A dummy bond is removed if:
-  // - The bonded atom is no longer accessible (not in ghost list)
-  // - The distance exceeds the cutoff
-  // - The pair is no longer complementary at the current temperature
+  // phase 1: remove dummy bonds that no longer meet criteria
+  remove_bonds();
 
-  for (i = 0; i < nlocal; i++) {
-    if (!(mask[i] & groupbit)) continue;
-
-    // only process scaffold (type 1) and staple (type 2) atoms
-    itype = type[i];
-    if (itype != iatomtype && itype != jatomtype) continue;
-
-    itag = tag[i];
-
-    // loop through bonds, removing ones that fail criteria
-    // use while loop since we may remove bonds and shift array
-    k = 0;
-    while (k < num_bond[i]) {
-      // skip non-dummy bonds (e.g., backbone bonds, hyb bonds)
-      if (bond_type[i][k] != dummy_bond_type) {
-        k++;
-        continue;
-      }
-
-      // find partner atom by tag
-      jtag = bond_atom[i][k];
-      j = atom->map(jtag);
-
-      // partner not found in local+ghost atoms - remove bond
-      if (j < 0) {
-        for (int m = k; m < num_bond[i] - 1; m++) {
-          bond_type[i][m] = bond_type[i][m+1];
-          bond_atom[i][m] = bond_atom[i][m+1];
-        }
-        num_bond[i]--;
-        remove_count++;
-        continue;
-      }
-
-      // skip if partner is not the expected opposite type
-      jtype = type[j];
-      if (!((itype == iatomtype && jtype == jatomtype) ||
-            (itype == jatomtype && jtype == iatomtype))) {
-        k++;
-        continue;
-      }
-
-      // calculate distance with minimum image convention for periodic boundaries
-      delx = x[i][0] - x[j][0];
-      dely = x[i][1] - x[j][1];
-      delz = x[i][2] - x[j][2];
-      if (domain->xperiodic) {
-        if (delx > domain->xprd_half) delx -= domain->xprd;
-        else if (delx < -domain->xprd_half) delx += domain->xprd;
-      }
-      if (domain->yperiodic) {
-        if (dely > domain->yprd_half) dely -= domain->yprd;
-        else if (dely < -domain->yprd_half) dely += domain->yprd;
-      }
-      if (domain->zperiodic) {
-        if (delz > domain->zprd_half) delz -= domain->zprd;
-        else if (delz < -domain->zprd_half) delz += domain->zprd;
-      }
-      rsq = delx*delx + dely*dely + delz*delz;
-
-      // remove bond if beyond cutoff or no longer complementary at current T
-      bool should_remove = (rsq > cutoff_sq) || !is_complementary(itag, jtag);
-
-      if (should_remove) {
-        for (int m = k; m < num_bond[i] - 1; m++) {
-          bond_type[i][m] = bond_type[i][m+1];
-          bond_atom[i][m] = bond_atom[i][m+1];
-        }
-        num_bond[i]--;
-        remove_count++;
-        continue;
-      }
-
-      k++;
-    }
-  }
-
-  // ========== SECOND PASS: Create new dummy bonds for eligible pairs ==========
-  // A new dummy bond is created if:
-  // - The pair is within cutoff distance
-  // - The pair is complementary at current temperature
-  // - No bond of any type exists between them
-  // - Both atoms have sufficient hybridization capacity
-
-  int *hyb_status = atom->ivector[hyb_status_index];
-  int *size = atom->ivector[size_index];
-
-  // loop over neighbor list to find candidate pairs
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-
-    if (!(mask[i] & groupbit)) continue;
-
-    // only process scaffold and staple atoms
-    itype = type[i];
-    if (itype != iatomtype && itype != jatomtype) continue;
-
-    itag = tag[i];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
-
-    jlist = firstneigh[i];
-    jnum = numneigh[i];
-
-    // check each neighbor of atom i
-    for (jj = 0; jj < jnum; jj++) {
-      j = jlist[jj];
-      j &= NEIGHMASK;
-
-      if (!(mask[j] & groupbit)) continue;
-
-      // must be opposite types (scaffold-staple pair)
-      jtype = type[j];
-      if (!((itype == iatomtype && jtype == jatomtype) ||
-            (itype == jatomtype && jtype == iatomtype))) continue;
-
-      if (i == j) continue;
-
-      // calculate distance with minimum image convention
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
-      if (domain->xperiodic) {
-        if (delx > domain->xprd_half) delx -= domain->xprd;
-        else if (delx < -domain->xprd_half) delx += domain->xprd;
-      }
-      if (domain->yperiodic) {
-        if (dely > domain->yprd_half) dely -= domain->yprd;
-        else if (dely < -domain->yprd_half) dely += domain->yprd;
-      }
-      if (domain->zperiodic) {
-        if (delz > domain->zprd_half) delz -= domain->zprd;
-        else if (delz < -domain->zprd_half) delz += domain->zprd;
-      }
-      rsq = delx*delx + dely*dely + delz*delz;
-
-      // skip if beyond cutoff distance
-      if (rsq > cutoff_sq) continue;
-
-      // check if pair is complementary at current temperature
-      jtag = tag[j];
-      if (!is_complementary(itag, jtag)) continue;
-
-      // skip if already bonded (any bond type)
-      if (has_bond(i, j)) continue;
-
-      // check hybridization capacity constraint
-      // min_size is the smaller of the two atoms' sizes (1 for half-bead, 2 for whole)
-      // each atom can have at most MAX_HYB_CAPACITY hybridization slots used
-      int min_size = (size[i] < size[j]) ? size[i] : size[j];
-      if (hyb_status[i] + min_size > MAX_HYB_CAPACITY) continue;
-      if (hyb_status[j] + min_size > MAX_HYB_CAPACITY) continue;
-
-      // with newton_bond on, only store bond on lower-tagged atom to avoid duplicates
-      if (itag > jtag) continue;
-
-      // create the dummy bond
-      if (num_bond[i] >= atom->bond_per_atom)
-        error->one(FLERR, "Too many bonds per atom in fix dnafold/bond/pre");
-
-      bond_type[i][num_bond[i]] = dummy_bond_type;
-      bond_atom[i][num_bond[i]] = jtag;
-      num_bond[i]++;
-      create_count++;
-    }
-  }
-
-  // ========== Finalize: aggregate counts and rebuild special lists ==========
+  // phase 2: create new dummy bonds for eligible neighbor pairs
+  create_bonds();
 
   // accumulate counts across all MPI processors
   int create_count_all, remove_count_all;
@@ -723,6 +532,211 @@ void FixDnafoldBondPre::post_integrate()
     logfile = logfile_save;
 
     next_reneighbor = update->ntimestep;
+  }
+}
+
+/* ----------------------------------------------------------------------
+   Remove dummy bonds that no longer meet validity criteria.
+   A dummy bond is removed if:
+   - The bonded atom is no longer accessible (not in ghost list)
+   - The distance exceeds the cutoff
+   - The pair is no longer complementary at the current temperature
+------------------------------------------------------------------------- */
+
+void FixDnafoldBondPre::remove_bonds()
+{
+  int nlocal = atom->nlocal;
+  double **x = atom->x;
+  tagint *tag = atom->tag;
+  int *mask = atom->mask;
+  int *type = atom->type;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+
+  for (int i = 0; i < nlocal; i++) {
+    if (!(mask[i] & groupbit)) continue;
+
+    // only process scaffold (type 1) and staple (type 2) atoms
+    int itype = type[i];
+    if (itype != iatomtype && itype != jatomtype) continue;
+
+    tagint itag = tag[i];
+
+    // loop through bonds, removing ones that fail criteria
+    // use while loop since we may remove bonds and shift array
+    int k = 0;
+    while (k < num_bond[i]) {
+      // skip non-dummy bonds (e.g., backbone bonds, hyb bonds)
+      if (bond_type[i][k] != dummy_bond_type) {
+        k++;
+        continue;
+      }
+
+      // find partner atom by tag
+      tagint jtag = bond_atom[i][k];
+      int j = atom->map(jtag);
+
+      // partner not found in local+ghost atoms - remove bond
+      if (j < 0) {
+        for (int m = k; m < num_bond[i] - 1; m++) {
+          bond_type[i][m] = bond_type[i][m+1];
+          bond_atom[i][m] = bond_atom[i][m+1];
+        }
+        num_bond[i]--;
+        remove_count++;
+        continue;
+      }
+
+      // skip if partner is not the expected opposite type
+      int jtype = type[j];
+      if (!((itype == iatomtype && jtype == jatomtype) ||
+            (itype == jatomtype && jtype == iatomtype))) {
+        k++;
+        continue;
+      }
+
+      // calculate distance with minimum image convention for periodic boundaries
+      double delx = x[i][0] - x[j][0];
+      double dely = x[i][1] - x[j][1];
+      double delz = x[i][2] - x[j][2];
+      if (domain->xperiodic) {
+        if (delx > domain->xprd_half) delx -= domain->xprd;
+        else if (delx < -domain->xprd_half) delx += domain->xprd;
+      }
+      if (domain->yperiodic) {
+        if (dely > domain->yprd_half) dely -= domain->yprd;
+        else if (dely < -domain->yprd_half) dely += domain->yprd;
+      }
+      if (domain->zperiodic) {
+        if (delz > domain->zprd_half) delz -= domain->zprd;
+        else if (delz < -domain->zprd_half) delz += domain->zprd;
+      }
+      double rsq = delx*delx + dely*dely + delz*delz;
+
+      // remove bond if beyond cutoff or no longer complementary at current T
+      bool should_remove = (rsq > cutoff_sq) || !is_complementary(itag, jtag);
+
+      if (should_remove) {
+        for (int m = k; m < num_bond[i] - 1; m++) {
+          bond_type[i][m] = bond_type[i][m+1];
+          bond_atom[i][m] = bond_atom[i][m+1];
+        }
+        num_bond[i]--;
+        remove_count++;
+        continue;
+      }
+
+      k++;
+    }
+  }
+}
+
+/* ----------------------------------------------------------------------
+   Create new dummy bonds for eligible complementary neighbor pairs.
+   A new dummy bond is created if:
+   - The pair is within cutoff distance
+   - The pair is complementary at current temperature
+   - No bond of any type exists between them
+   - Both atoms have sufficient hybridization capacity
+------------------------------------------------------------------------- */
+
+void FixDnafoldBondPre::create_bonds()
+{
+  int inum = list->inum;
+  int *ilist = list->ilist;
+  int *numneigh = list->numneigh;
+  int **firstneigh = list->firstneigh;
+
+  double **x = atom->x;
+  tagint *tag = atom->tag;
+  int *mask = atom->mask;
+  int *type = atom->type;
+  int **bond_type = atom->bond_type;
+  tagint **bond_atom = atom->bond_atom;
+  int *num_bond = atom->num_bond;
+  int *hyb_status = atom->ivector[hyb_status_index];
+  int *size = atom->ivector[size_index];
+
+  // loop over neighbor list to find candidate pairs
+  for (int ii = 0; ii < inum; ii++) {
+    int i = ilist[ii];
+
+    if (!(mask[i] & groupbit)) continue;
+
+    // only process scaffold and staple atoms
+    int itype = type[i];
+    if (itype != iatomtype && itype != jatomtype) continue;
+
+    tagint itag = tag[i];
+    double xtmp = x[i][0];
+    double ytmp = x[i][1];
+    double ztmp = x[i][2];
+
+    int *jlist = firstneigh[i];
+    int jnum = numneigh[i];
+
+    // check each neighbor of atom i
+    for (int jj = 0; jj < jnum; jj++) {
+      int j = jlist[jj];
+      j &= NEIGHMASK;
+
+      if (!(mask[j] & groupbit)) continue;
+
+      // must be opposite types (scaffold-staple pair)
+      int jtype = type[j];
+      if (!((itype == iatomtype && jtype == jatomtype) ||
+            (itype == jatomtype && jtype == iatomtype))) continue;
+
+      if (i == j) continue;
+
+      // calculate distance with minimum image convention
+      double delx = xtmp - x[j][0];
+      double dely = ytmp - x[j][1];
+      double delz = ztmp - x[j][2];
+      if (domain->xperiodic) {
+        if (delx > domain->xprd_half) delx -= domain->xprd;
+        else if (delx < -domain->xprd_half) delx += domain->xprd;
+      }
+      if (domain->yperiodic) {
+        if (dely > domain->yprd_half) dely -= domain->yprd;
+        else if (dely < -domain->yprd_half) dely += domain->yprd;
+      }
+      if (domain->zperiodic) {
+        if (delz > domain->zprd_half) delz -= domain->zprd;
+        else if (delz < -domain->zprd_half) delz += domain->zprd;
+      }
+      double rsq = delx*delx + dely*dely + delz*delz;
+
+      // skip if beyond cutoff distance
+      if (rsq > cutoff_sq) continue;
+
+      // check if pair is complementary at current temperature
+      tagint jtag = tag[j];
+      if (!is_complementary(itag, jtag)) continue;
+
+      // skip if already bonded (any bond type)
+      if (has_bond(i, j)) continue;
+
+      // check hybridization capacity constraint
+      // min_size is the smaller of the two atoms' sizes (1 for half-bead, 2 for whole)
+      // each atom can have at most MAX_HYB_CAPACITY hybridization slots used
+      int min_size = (size[i] < size[j]) ? size[i] : size[j];
+      if (hyb_status[i] + min_size > MAX_HYB_CAPACITY) continue;
+      if (hyb_status[j] + min_size > MAX_HYB_CAPACITY) continue;
+
+      // with newton_bond on, only store bond on lower-tagged atom to avoid duplicates
+      if (itag > jtag) continue;
+
+      // create the dummy bond
+      if (num_bond[i] >= atom->bond_per_atom)
+        error->one(FLERR, "Too many bonds per atom in fix dnafold/bond/pre");
+
+      bond_type[i][num_bond[i]] = dummy_bond_type;
+      bond_atom[i][num_bond[i]] = jtag;
+      num_bond[i]++;
+      create_count++;
+    }
   }
 }
 
