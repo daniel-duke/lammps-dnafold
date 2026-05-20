@@ -12,7 +12,7 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
@@ -47,19 +47,18 @@ class FixDnafoldAngleLp : public Fix {
   // === Input parameters ===
   double r12;                      // characteristic length for conversion
   char *lp_file;                   // persistence length file path
-  char *tvar;                      // temperature variable name (without v_)
+  char *tvar;                      // temperature variable name
   int tvar_index;                  // temperature variable index
 
-  // === Persistence length data (from file) ===
+  // === Persistence length data ===
   std::vector<double> temperatures;
   std::vector<double> persistence_lengths;
   int num_data_points;
 
-  // === Angle parameter access ===
+  // === Angle parameter ===
   double *k_angle;                 // pointer to angle K array (from extract)
 
   // === Constants ===
-  // Boltzmann constant in nano units (pN·nm/K)
   static constexpr double BOLTZMANN = 0.01380649;
 
   // === Helper functions ===

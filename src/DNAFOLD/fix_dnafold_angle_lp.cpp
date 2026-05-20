@@ -12,13 +12,14 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 
    fix dnafold/angle/lp dynamically updates the bending stiffness (K) for
    angle type 1 based on the current temperature and persistence length
    data from a file.
 
-   Formula: k_theta = Lp * kB * T / r12, then K_angle = k_theta / 2
+   Lp formula: k_theta = Lp * kB * T / r12
+   K formula: K_angle = k_theta / 2
 ------------------------------------------------------------------------- */
 
 #include "fix_dnafold_angle_lp.h"
@@ -47,26 +48,26 @@ using namespace FixConst;
 FixDnafoldAngleLp::FixDnafoldAngleLp(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), lp_file(nullptr), tvar(nullptr), k_angle(nullptr)
 {
-  // syntax: fix ID group dnafold/angle/lp nevery r12 lp_file v_temperature
-  if (narg != 7) error->all(FLERR, "Illegal fix dnafold/angle/lp command");
+  // syntax: fix ID group dnafold/angle/lp nevery r12 lp_file temp_var
+  if (narg != 7) error->all(FLERR, "Illegal command");
 
   MPI_Comm_rank(world, &me);
   MPI_Comm_size(world, &nprocs);
 
   // parse nevery - how often to update angle parameters
   nevery = utils::inumeric(FLERR, arg[3], false, lmp);
-  if (nevery <= 0) error->all(FLERR, "Illegal fix dnafold/angle/lp nevery value");
+  if (nevery <= 0) error->all(FLERR, "Illegal nevery");
 
-  // parse r12 - characteristic length for conversion
+  // parse r12 - bond length, for persistence length formula
   r12 = utils::numeric(FLERR, arg[4], false, lmp);
-  if (r12 <= 0.0) error->all(FLERR, "Illegal fix dnafold/angle/lp r12 value");
+  if (r12 <= 0.0) error->all(FLERR, "Illegal bond length");
 
-  // parse persistence length file path
+  // parse lp_file - persistence length file path
   lp_file = utils::strdup(arg[5]);
 
-  // parse temperature variable name (must start with v_)
+  // parse temp_var - temperature variable name (must start with v_)
   if (strncmp(arg[6], "v_", 2) != 0)
-    error->all(FLERR, "Temperature variable for fix dnafold/angle/lp must start with v_");
+    error->all(FLERR, "Temperature variable must start with v_");
   tvar = utils::strdup(arg[6] + 2);
   tvar_index = -1;
 
@@ -117,7 +118,7 @@ void FixDnafoldAngleLp::init()
 
   k_angle = (double *) ptr;
 
-  // validate we have at least 1 angle type
+  // validate there is at least 1 angle type
   if (atom->nangletypes < 1)
     error->all(FLERR, "Fix dnafold/angle/lp requires at least 1 angle type");
 }
@@ -133,7 +134,6 @@ void FixDnafoldAngleLp::setup(int /* vflag */)
 /* ----------------------------------------------------------------------
    Read persistence length data file.
    Format: two columns - temperature and persistence length
-   Lines starting with # are comments
 ------------------------------------------------------------------------- */
 
 void FixDnafoldAngleLp::read_lp_file()
@@ -298,7 +298,6 @@ void FixDnafoldAngleLp::update_angle_k()
   double T = input->variable->compute_equal(tvar_index);
 
   // get interpolated persistence length at current temperature
-  // returns -1.0 if T exceeds the table maximum
   double Lp = get_persistence_length(T);
 
   if (Lp < 0.0) {

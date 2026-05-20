@@ -12,13 +12,13 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 
    fix dnafold/bond/half creates and breaks "half-bonds" between same-
-   type half-beads (size=1) that are both hybridized to a common central
-   central whole-bead (size=2). The bond type passed to the fix to use
-   for the half bonds should apply no forces, since the sole purpose of
-   the bond is to remove pairwise interactions between the half-beads.
+   type half-beads that are both hybridized to a common central whole-
+   bead. The bond type passed to the fix to use for the half bonds should
+   apply no forces, since the sole purpose of the bond is to remove
+   pairwise interactions between the half-beads.
 ------------------------------------------------------------------------- */
 
 #include "fix_dnafold_bond_half.h"
@@ -46,26 +46,25 @@ FixDnafoldBondHalf::FixDnafoldBondHalf(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), bond_requests(nullptr)
 {
   // syntax: fix ID group dnafold/bond/half nevery cutoff bond_type
-  if (narg != 6) error->all(FLERR,"Illegal fix dnafold/bond/half command");
+  if (narg != 6) error->all(FLERR,"Illegal command");
 
   MPI_Comm_rank(world,&me);
   MPI_Comm_size(world,&nprocs);
 
   // parse nevery - how often to check for bond creation/breaking
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
-  if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half nevery");
+  if (nevery <= 0) error->all(FLERR,"Illegal nevery");
 
-  // parse cutoff distance for half-bond creation and breaking
+  // parse cutoff - distance for half-bond creation/breaking
   double cutoff = utils::numeric(FLERR,arg[4],false,lmp);
-  if (cutoff <= 0.0) error->all(FLERR,"Illegal fix dnafold/bond/half cutoff");
+  if (cutoff <= 0.0) error->all(FLERR,"Illegal cutoff");
   cutoff_sq = cutoff * cutoff;
 
-  // parse the bond type to use for half-bonds
+  // parse bond_type - bond type to use for half-bonds
   half_bond_type = utils::inumeric(FLERR,arg[5],false,lmp);
-  if (half_bond_type <= 0) error->all(FLERR,"Illegal fix dnafold/bond/half bond_type");
+  if (half_bond_type <= 0) error->all(FLERR,"Illegal dummy bond type");
 
   // half-bonds form between same-type atoms (both type 1 or both type 2)
-  // but we search from central atoms that are type 1 or type 2
   iatomtype = 1;
   jatomtype = 2;
 
@@ -74,7 +73,7 @@ FixDnafoldBondHalf::FixDnafoldBondHalf(LAMMPS *lmp, int narg, char **arg) :
   next_reneighbor = update->ntimestep + 1;
 
   vector_flag = 1;
-  size_vector = 4;  // create, break, total create, total break
+  size_vector = 4;
   global_freq = 1;
   extvector = 0;
 
@@ -168,7 +167,7 @@ void FixDnafoldBondHalf::post_integrate()
   // phase 1: remove half-bonds that have stretched beyond cutoff
   remove_bonds();
 
-  // phase 2: create new half-bonds between eligible same-type neighbors
+  // phase 2: create new half-bonds between eligible neighbors
   create_bonds();
 
   // send bond creation requests to home processors of ghost atoms
@@ -277,7 +276,7 @@ void FixDnafoldBondHalf::post_integrate()
 
 /* ----------------------------------------------------------------------
    Create half-bonds between same-type half-beads that share a common
-   central whole-bead. We loop over central atoms (size=2) and look for
+   central whole-bead. Loop over central atoms (size=2) and look for
    pairs of opposite-type neighbors (relative to center) with size=1.
 ------------------------------------------------------------------------- */
 
@@ -302,12 +301,10 @@ void FixDnafoldBondHalf::create_bonds()
     int itype = type[i];
     if (itype != iatomtype && itype != jatomtype) continue;
 
-    // central atom must be a whole bead (size = 2)
+    // central atom must be a whole bead (size=2)
     if (size[i] != 2) continue;
 
-    // collect all bonded neighbors that are:
-    // - opposite type from central atom
-    // - half-beads (size = 1)
+    // collect all bonded neighbors that are size=1 and opposite type from central atom
     std::vector<int> opposite_neighbors;
 
     for (int n = 0; n < nspecial[i][0]; n++) {
@@ -414,7 +411,7 @@ void FixDnafoldBondHalf::remove_bonds()
   for (int i = 0; i < nlocal; i++) {
     int k = 0;
 
-    // loop through bonds using while loop since we may remove bonds
+    // loop through bonds
     while (k < num_bond[i]) {
       // skip if not a half-bond
       if (bond_type[i][k] != half_bond_type) {
@@ -422,7 +419,7 @@ void FixDnafoldBondHalf::remove_bonds()
         continue;
       }
 
-      // atom i must be a half-bead (size == 1) for this to be a valid half-bond
+      // atom i must be a half-bead (size==1)
       if (size[i] != 1) {
         k++;
         continue;
@@ -432,16 +429,16 @@ void FixDnafoldBondHalf::remove_bonds()
       tagint j_tag = bond_atom[i][k];
       int j = atom->map(j_tag);
 
-      // partner not found - remove the bond
+      // partner not found
       if (j < 0) {
         num_bond[i]--;
         bond_atom[i][k] = bond_atom[i][num_bond[i]];
         bond_type[i][k] = bond_type[i][num_bond[i]];
         break_count++;
-        continue;  // don't increment k since we shifted
+        continue;
       }
 
-      // partner must also be a half-bead (size == 1) and same type as i
+      // partner must also be a half-bead (size=1) and same type as i
       if (size[j] != 1 || type[j] != type[i]) {
         k++;
         continue;
@@ -473,7 +470,6 @@ void FixDnafoldBondHalf::remove_bonds()
         bond_atom[i][k] = bond_atom[i][num_bond[i]];
         bond_type[i][k] = bond_type[i][num_bond[i]];
         break_count++;
-        // don't increment k since we moved the last bond into this position
       } else {
         k++;
       }

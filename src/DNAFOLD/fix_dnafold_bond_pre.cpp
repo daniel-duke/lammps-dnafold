@@ -12,11 +12,11 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 
    fix dnafold/bond/pre creates and removes "dummy" bonds between
    complementary atom pairs. These dummy bonds act as precursors to
-   hybridization bonds - they identify which pairs could potentially
+   hybridization bonds, identifying which pairs could potentially
    hybridize but don't yet contribute to the hybridization state.
 ------------------------------------------------------------------------- */
 
@@ -48,22 +48,39 @@ using namespace LAMMPS_NS;
 using namespace FixConst;
 
 static constexpr double BIG = 1.0e20;
-static constexpr int MAX_HYB_CAPACITY = 2;
 
 /* ---------------------------------------------------------------------- */
 
 FixDnafoldBondPre::FixDnafoldBondPre(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg), complementarity_file(nullptr), tvar(nullptr)
 {
-  // syntax: fix ID group dnafold/bond/pre nevery cutoff dummy_btype compfile tempvar
-  if (narg != 8) error->all(FLERR,"Illegal fix dnafold/bond/pre command");
+  // syntax: fix ID group dnafold/bond/pre nevery cutoff bond_type comp_file temp_var
+  if (narg != 8) error->all(FLERR,"Illegal command");
 
   MPI_Comm_rank(world, &me);
   MPI_Comm_size(world, &nprocs);
 
   // parse nevery - how often to check for bond creation/removal
   nevery = utils::inumeric(FLERR, arg[3], false, lmp);
-  if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/bond/pre command");
+  if (nevery <= 0) error->all(FLERR,"Illegal nevery");
+
+  // parse cutoff - distance for dummy bond creation
+  cutoff_sq = utils::numeric(FLERR, arg[4], false, lmp);
+  if (cutoff_sq <= 0.0) error->all(FLERR,"Illegal cutoff");
+  cutoff_sq = cutoff_sq * cutoff_sq;
+
+  // parse bond_type - bond type to use for dummy bonds
+  dummy_bond_type = utils::inumeric(FLERR, arg[5], false, lmp);
+  if (dummy_bond_type <= 0) error->all(FLERR,"Illegal dummy bond type");
+
+  // parse comp_file - complementarity file path
+  complementarity_file = utils::strdup(arg[6]);
+
+  // parse temp_var - temperature variable name (must start with v_)
+  if (strncmp(arg[7], "v_", 2) != 0)
+    error->all(FLERR,"Temperature variable must start with v_");
+  tvar = utils::strdup(arg[7] + 2);
+  tvar_index = -1;
 
   // set up fix flags for reneighboring and output vector
   force_reneighbor = 1;
@@ -76,24 +93,6 @@ FixDnafoldBondPre::FixDnafoldBondPre(LAMMPS *lmp, int narg, char **arg) :
   // dummy bonds form between type 1 (scaffold) and type 2 (staple) atoms only
   iatomtype = 1;
   jatomtype = 2;
-
-  // parse cutoff distance for dummy bond creation
-  cutoff_sq = utils::numeric(FLERR, arg[4], false, lmp);
-  if (cutoff_sq <= 0.0) error->all(FLERR,"Illegal cutoff");
-  cutoff_sq = cutoff_sq * cutoff_sq;
-
-  // parse dummy bond type
-  dummy_bond_type = utils::inumeric(FLERR, arg[5], false, lmp);
-  if (dummy_bond_type <= 0) error->all(FLERR,"Illegal dummy bond type");
-
-  // parse complementarity file path
-  complementarity_file = utils::strdup(arg[6]);
-
-  // parse temperature variable name (must start with v_)
-  if (strncmp(arg[7], "v_", 2) != 0)
-    error->all(FLERR,"Temperature variable for fix dnafold/bond/pre must start with v_");
-  tvar = utils::strdup(arg[7] + 2);
-  tvar_index = -1;
 
   // initialize counters and data structures
   num_temperatures = 0;
@@ -129,21 +128,19 @@ int FixDnafoldBondPre::setmask()
 
 void FixDnafoldBondPre::init()
 {
-  // find the hyb_status custom property (tracks hybridization slots used)
+  // find the hyb_status_5p and hyb_status_3p custom properties
   int flag_hyb, cols_hyb;
-  hyb_status_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
-  if (hyb_status_index < 0)
-    error->all(FLERR,"Could not find hyb_status property for fix dnafold/bond/pre");
+  hyb_status_5p_index = atom->find_custom("hyb_status_5p", flag_hyb, cols_hyb);
+  if (hyb_status_5p_index < 0)
+    error->all(FLERR,"Could not find hyb_status_5p property for fix dnafold/bond/pre");
   if (flag_hyb != 0)
-    error->all(FLERR,"Property hyb_status must be integer");
+    error->all(FLERR,"Property hyb_status_5p must be integer");
 
-  // find the size custom property (1 for half-beads, 2 for whole beads)
-  int flag_size, cols_size;
-  size_index = atom->find_custom("size", flag_size, cols_size);
-  if (size_index < 0)
-    error->all(FLERR,"Could not find size property for fix dnafold/bond/pre");
-  if (flag_size != 0)
-    error->all(FLERR,"Property size must be integer");
+  hyb_status_3p_index = atom->find_custom("hyb_status_3p", flag_hyb, cols_hyb);
+  if (hyb_status_3p_index < 0)
+    error->all(FLERR,"Could not find hyb_status_3p property for fix dnafold/bond/pre");
+  if (flag_hyb != 0)
+    error->all(FLERR,"Property hyb_status_3p must be integer");
 
   // find and validate the temperature variable
   tvar_index = input->variable->find(tvar);
@@ -238,8 +235,7 @@ void FixDnafoldBondPre::read_complementarity_file()
         continue;
       }
 
-      // parse TYPES section: read bond type and energy depth pairs
-      // we only need the energy values to determine minimum threshold
+      // parse TYPES section: read energies for determining minimum energy threshold
       if (current_section == TYPES) {
         std::istringstream iss(line);
         int btype;
@@ -268,14 +264,20 @@ void FixDnafoldBondPre::read_complementarity_file()
       }
 
       // parse PAIRS section: read complementary atom pairs with per-temperature energies
-      // format: tag1 tag2 <ignored_column> energy1 energy2 ...
+      // format: tag1 tag2 <ignored_column> half_i half_j energy1 energy2 ...
       if (current_section == PAIRS) {
         std::istringstream iss(line);
         tagint tag1, tag2;
         std::string ignored_column;
-        if (!(iss >> tag1 >> tag2 >> ignored_column)) {
+        int half_i_val, half_j_val;
+        if (!(iss >> tag1 >> tag2 >> ignored_column >> half_i_val >> half_j_val)) {
           error->one(FLERR, fmt::format("Invalid PAIRS format in '{}' at line {}",
                                         complementarity_file, line_num));
+        }
+
+        if (half_i_val < 0 || half_i_val > 2 || half_j_val < 0 || half_j_val > 2) {
+          error->one(FLERR, fmt::format("PAIRS line {} in '{}': half values must be 0, 1, or 2",
+                                        line_num, complementarity_file));
         }
 
         // read energy values for each temperature point
@@ -285,7 +287,7 @@ void FixDnafoldBondPre::read_complementarity_file()
           energies.push_back(energy);
         }
 
-        // verify we have the right number of energy values
+        // check the number of energy values
         if ((int)energies.size() != num_temperatures) {
           error->one(FLERR, fmt::format("PAIRS line {} in '{}' has {} energies, expected {}",
                                         line_num, complementarity_file,
@@ -293,8 +295,15 @@ void FixDnafoldBondPre::read_complementarity_file()
         }
 
         // store with tag1 < tag2 for consistent lookup
-        if (tag1 > tag2) std::swap(tag1, tag2);
-        complementarity_map[std::make_pair(tag1, tag2)] = energies;
+        if (tag1 > tag2) {
+          std::swap(tag1, tag2);
+          std::swap(half_i_val, half_j_val);
+        }
+        PairData pd;
+        pd.half_i = half_i_val;
+        pd.half_j = half_j_val;
+        pd.energies = energies;
+        complementarity_map[std::make_pair(tag1, tag2)] = pd;
 
       } else if (current_section == NONE) {
         error->one(FLERR, fmt::format("Line {} in '{}' appears before any section header",
@@ -313,7 +322,7 @@ void FixDnafoldBondPre::read_complementarity_file()
       error->one(FLERR, fmt::format("No TYPES section found in '{}'", complementarity_file));
     }
 
-    // minimum energy threshold: pairs with interpolated energy below this are not complementary
+    // minimum energy threshold for forming bonds
     min_energy_threshold = *std::min_element(type_energies.begin(), type_energies.end());
 
     if (complementarity_map.empty()) {
@@ -321,7 +330,6 @@ void FixDnafoldBondPre::read_complementarity_file()
     }
 
     // sort temperatures (ascending) and reorder pair energies to match
-    // this allows temperatures to be listed in any order in the file
     if (num_temperatures > 1) {
       // create index array and sort by temperature
       std::vector<size_t> sort_indices(num_temperatures);
@@ -341,9 +349,9 @@ void FixDnafoldBondPre::read_complementarity_file()
       for (auto &entry : complementarity_map) {
         std::vector<double> sorted_energies(num_temperatures);
         for (int i = 0; i < num_temperatures; i++) {
-          sorted_energies[i] = entry.second[sort_indices[i]];
+          sorted_energies[i] = entry.second.energies[sort_indices[i]];
         }
-        entry.second = std::move(sorted_energies);
+        entry.second.energies = std::move(sorted_energies);
       }
     }
   }
@@ -363,20 +371,24 @@ void FixDnafoldBondPre::read_complementarity_file()
   int map_size = complementarity_map.size();
   MPI_Bcast(&map_size, 1, MPI_INT, 0, world);
 
-  // broadcast complementarity map contents by packing into arrays
+  // broadcast complementarity map by packing into arrays
   if (map_size > 0) {
     std::vector<tagint> tags1(map_size);
     std::vector<tagint> tags2(map_size);
+    std::vector<int> halves_i(map_size);
+    std::vector<int> halves_j(map_size);
     std::vector<double> all_energies(map_size * num_temperatures);
 
-    // rank 0 packs map data into flat arrays for MPI broadcast
+    // if rank 0, pack data into flat arrays for MPI broadcast
     if (me == 0) {
       int idx = 0;
       for (const auto &entry : complementarity_map) {
         tags1[idx] = entry.first.first;
         tags2[idx] = entry.first.second;
+        halves_i[idx] = entry.second.half_i;
+        halves_j[idx] = entry.second.half_j;
         for (int t = 0; t < num_temperatures; t++) {
-          all_energies[idx * num_temperatures + t] = entry.second[t];
+          all_energies[idx * num_temperatures + t] = entry.second.energies[t];
         }
         idx++;
       }
@@ -384,16 +396,21 @@ void FixDnafoldBondPre::read_complementarity_file()
 
     MPI_Bcast(tags1.data(), map_size, MPI_LMP_TAGINT, 0, world);
     MPI_Bcast(tags2.data(), map_size, MPI_LMP_TAGINT, 0, world);
+    MPI_Bcast(halves_i.data(), map_size, MPI_INT, 0, world);
+    MPI_Bcast(halves_j.data(), map_size, MPI_INT, 0, world);
     MPI_Bcast(all_energies.data(), map_size * num_temperatures, MPI_DOUBLE, 0, world);
 
-    // non-root processors unpack arrays into their local map
+    // if non-root (not rank 0), unpack arrays into local variables
     if (me != 0) {
       for (int i = 0; i < map_size; i++) {
-        std::vector<double> energies(num_temperatures);
+        PairData pd;
+        pd.half_i = halves_i[i];
+        pd.half_j = halves_j[i];
+        pd.energies.resize(num_temperatures);
         for (int t = 0; t < num_temperatures; t++) {
-          energies[t] = all_energies[i * num_temperatures + t];
+          pd.energies[t] = all_energies[i * num_temperatures + t];
         }
-        complementarity_map[std::make_pair(tags1[i], tags2[i])] = energies;
+        complementarity_map[std::make_pair(tags1[i], tags2[i])] = pd;
       }
     }
   }
@@ -424,7 +441,7 @@ double FixDnafoldBondPre::get_interpolated_energy(tagint tag_i, tagint tag_j)
   auto it = complementarity_map.find(std::make_pair(tag1, tag2));
   if (it == complementarity_map.end()) return -BIG;
 
-  const std::vector<double> &energies = it->second;
+  const std::vector<double> &energies = it->second.energies;
 
   // get current temperature from the LAMMPS variable
   double T = input->variable->compute_equal(tvar_index);
@@ -463,8 +480,27 @@ bool FixDnafoldBondPre::is_complementary(tagint tag_i, tagint tag_j)
 }
 
 /* ----------------------------------------------------------------------
+   Return the half values for a potential bonding pair.
+   Returns {half for tag_i, half for tag_j}.
+   Returns {-1, -1} if pair not in map.
+------------------------------------------------------------------------- */
+
+std::pair<int,int> FixDnafoldBondPre::get_halves(tagint tag_i, tagint tag_j)
+{
+  tagint tag1 = (tag_i < tag_j) ? tag_i : tag_j;
+  tagint tag2 = (tag_i < tag_j) ? tag_j : tag_i;
+
+  auto it = complementarity_map.find(std::make_pair(tag1, tag2));
+  if (it == complementarity_map.end()) return std::make_pair(-1, -1);
+
+  // half_i in map corresponds to tag1 (lower-tagged atom)
+  if (tag_i < tag_j) return std::make_pair(it->second.half_i, it->second.half_j);
+  else               return std::make_pair(it->second.half_j, it->second.half_i);
+}
+
+/* ----------------------------------------------------------------------
    Check if two atoms are directly bonded using the special neighbor list.
-   Returns 1 if bonded (j is in i's 1-2 neighbor list), 0 otherwise.
+   Returns 1 if bonded, 0 otherwise.
 ------------------------------------------------------------------------- */
 
 bool FixDnafoldBondPre::has_bond(int i, int j)
@@ -564,7 +600,6 @@ void FixDnafoldBondPre::remove_bonds()
     tagint itag = tag[i];
 
     // loop through bonds, removing ones that fail criteria
-    // use while loop since we may remove bonds and shift array
     int k = 0;
     while (k < num_bond[i]) {
       // skip non-dummy bonds (e.g., backbone bonds, hyb bonds)
@@ -577,7 +612,7 @@ void FixDnafoldBondPre::remove_bonds()
       tagint jtag = bond_atom[i][k];
       int j = atom->map(jtag);
 
-      // partner not found in local+ghost atoms - remove bond
+      // partner not found in local+ghost atoms
       if (j < 0) {
         for (int m = k; m < num_bond[i] - 1; m++) {
           bond_type[i][m] = bond_type[i][m+1];
@@ -588,7 +623,7 @@ void FixDnafoldBondPre::remove_bonds()
         continue;
       }
 
-      // skip if partner is not the expected opposite type
+      // check if partner is opposite type (scaffold-staple pair)
       int jtype = type[j];
       if (!((itype == iatomtype && jtype == jatomtype) ||
             (itype == jatomtype && jtype == iatomtype))) {
@@ -596,7 +631,7 @@ void FixDnafoldBondPre::remove_bonds()
         continue;
       }
 
-      // calculate distance with minimum image convention for periodic boundaries
+      // calculate distance with minimum image convention
       double delx = x[i][0] - x[j][0];
       double dely = x[i][1] - x[j][1];
       double delz = x[i][2] - x[j][2];
@@ -655,8 +690,8 @@ void FixDnafoldBondPre::create_bonds()
   int **bond_type = atom->bond_type;
   tagint **bond_atom = atom->bond_atom;
   int *num_bond = atom->num_bond;
-  int *hyb_status = atom->ivector[hyb_status_index];
-  int *size = atom->ivector[size_index];
+  int *hyb_status_5p = atom->ivector[hyb_status_5p_index];
+  int *hyb_status_3p = atom->ivector[hyb_status_3p_index];
 
   // loop over neighbor list to find candidate pairs
   for (int ii = 0; ii < inum; ii++) {
@@ -718,12 +753,21 @@ void FixDnafoldBondPre::create_bonds()
       // skip if already bonded (any bond type)
       if (has_bond(i, j)) continue;
 
-      // check hybridization capacity constraint
-      // min_size is the smaller of the two atoms' sizes (1 for half-bead, 2 for whole)
-      // each atom can have at most MAX_HYB_CAPACITY hybridization slots used
-      int min_size = (size[i] < size[j]) ? size[i] : size[j];
-      if (hyb_status[i] + min_size > MAX_HYB_CAPACITY) continue;
-      if (hyb_status[j] + min_size > MAX_HYB_CAPACITY) continue;
+      // check hybridization capacity using the half values for this pair
+      std::pair<int,int> halves = get_halves(itag, jtag);
+      int half_i = halves.first;
+      int half_j = halves.second;
+
+      // half==0: bond uses whole bead
+      // half==1: bond uses 5p side only
+      // half==2: bond uses 3p side only
+      bool i_has_room = (half_i == 0) ? (hyb_status_5p[i] == 0 && hyb_status_3p[i] == 0)
+                      : (half_i == 1) ? (hyb_status_5p[i] == 0)
+                                      : (hyb_status_3p[i] == 0);
+      bool j_has_room = (half_j == 0) ? (hyb_status_5p[j] == 0 && hyb_status_3p[j] == 0)
+                      : (half_j == 1) ? (hyb_status_5p[j] == 0)
+                                      : (hyb_status_3p[j] == 0);
+      if (!i_has_room || !j_has_room) continue;
 
       // with newton_bond on, only store bond on lower-tagged atom to avoid duplicates
       if (itag > jtag) continue;

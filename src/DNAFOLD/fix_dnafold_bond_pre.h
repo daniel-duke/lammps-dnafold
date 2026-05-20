@@ -57,8 +57,8 @@ class FixDnafoldBondPre : public Fix {
   char *complementarity_file;
 
   // === Property indices ===
-  int hyb_status_index;
-  int size_index;
+  int hyb_status_5p_index;
+  int hyb_status_3p_index;
 
   // === Temperature data ===
   std::vector<double> temperatures;
@@ -68,18 +68,19 @@ class FixDnafoldBondPre : public Fix {
   int tvar_index;
 
   // === Complementarity data ===
-  // Hash function for pair of tagints
+  struct PairData {
+    int half_i;
+    int half_j;
+    std::vector<double> energies;
+  };
   struct PairHash {
     std::size_t operator()(const std::pair<tagint, tagint> &p) const {
       return std::hash<tagint>()(p.first) ^ (std::hash<tagint>()(p.second) << 1);
     }
   };
-  // Map: (tag1, tag2) -> vector of energies at each temperature
-  // tag1 < tag2 always for consistent lookup
-  std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHash> complementarity_map;
+  std::unordered_map<std::pair<tagint, tagint>, PairData, PairHash> complementarity_map;
 
   // === Counters ===
-  // Output vector: [0]=created, [1]=removed, [2]=total_created, [3]=total_removed
   int create_count, remove_count;
   bigint create_count_total, remove_count_total;
 
@@ -92,6 +93,7 @@ class FixDnafoldBondPre : public Fix {
   void read_complementarity_file();
   double get_interpolated_energy(tagint, tagint);
   bool is_complementary(tagint, tagint);
+  std::pair<int,int> get_halves(tagint, tagint);
   bool has_bond(int, int);
 };
 

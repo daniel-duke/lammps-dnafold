@@ -12,11 +12,11 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 
    fix dnafold/angle/hyb creates angles between fully hybridized atoms.
    Angles are created when a central atom and two of its bonded neighbors
-   are all fully hybridized (hyb_status == size). The angle type depends
+   are all fully hybridized (hyb_status_5p + hyb_status_3p == size). The angle type depends
    on whether the central atom is at a crossover junction (is_crossover).
    Angles are stored on the central atom.
 ------------------------------------------------------------------------- */
@@ -52,19 +52,19 @@ FixDnafoldAngleHyb::FixDnafoldAngleHyb(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg)
 {
   // syntax: fix ID group dnafold/angle/hyb nevery max_angle_deviation
-  if (narg != 5) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
-
-  MPI_Comm_rank(world,&me);
-  MPI_Comm_size(world,&nprocs);
+  if (narg != 5) error->all(FLERR,"Illegal command");
 
   // parse nevery - how often to check for angle creation
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
-  if (nevery <= 0) error->all(FLERR,"Illegal fix dnafold/angle/hyb command");
+  if (nevery <= 0) error->all(FLERR,"Illegal nevery");
 
   // parse max_angle_deviation - maximum deviation from equilibrium angle in degrees
   max_angle_deviation = utils::numeric(FLERR,arg[4],false,lmp);
   if (max_angle_deviation <= 0.0 || max_angle_deviation > 90.0)
-    error->all(FLERR,"Illegal max_angle_deviation for fix dnafold/angle/hyb (must be 0 < max_angle_deviation <= 90)");
+    error->all(FLERR,"Illegal max_angle_deviation (must be 0 < max_angle_deviation <= 90)");
+
+  MPI_Comm_rank(world,&me);
+  MPI_Comm_size(world,&nprocs);
 
   // set up fix flags for reneighboring and output vector
   force_reneighbor = 1;
@@ -98,13 +98,19 @@ int FixDnafoldAngleHyb::setmask()
 
 void FixDnafoldAngleHyb::init()
 {
-  // find the hyb_status custom property (tracks hybridization slots used: 0-2)
+  // find the hyb_status_5p and hyb_status_3p custom properties
   int flag_hyb, cols_hyb;
-  hyb_status_index = atom->find_custom("hyb_status", flag_hyb, cols_hyb);
-  if (hyb_status_index < 0)
-    error->all(FLERR,"Could not find i_hyb_status property for fix dnafold/angle/hyb");
+  hyb_status_5p_index = atom->find_custom("hyb_status_5p", flag_hyb, cols_hyb);
+  if (hyb_status_5p_index < 0)
+    error->all(FLERR,"Could not find i_hyb_status_5p property for fix dnafold/angle/hyb");
   if (flag_hyb != 0)
-    error->all(FLERR,"Property i_hyb_status must be an integer property");
+    error->all(FLERR,"Property i_hyb_status_5p must be an integer property");
+
+  hyb_status_3p_index = atom->find_custom("hyb_status_3p", flag_hyb, cols_hyb);
+  if (hyb_status_3p_index < 0)
+    error->all(FLERR,"Could not find i_hyb_status_3p property for fix dnafold/angle/hyb");
+  if (flag_hyb != 0)
+    error->all(FLERR,"Property i_hyb_status_3p must be an integer property");
 
   // find the is_crossover custom property (1 if at crossover junction, 0 otherwise)
   int flag_cross, cols_cross;
@@ -168,7 +174,7 @@ void FixDnafoldAngleHyb::post_integrate()
 /* ----------------------------------------------------------------------
    Find fully hybridized atom triplets and create angles.
    An angle j-i-k is created when:
-   - Center atom i is fully hybridized (hyb_status[i] == size[i])
+   - Center atom i is fully hybridized (hyb_status_5p[i] + hyb_status_3p[i] == size[i])
    - Both end atoms j and k are bonded to i and fully hybridized
    - Atoms j and k are not directly bonded to each other
    - The angle doesn't already exist
@@ -187,7 +193,8 @@ void FixDnafoldAngleHyb::create_angles()
   int *num_angle = atom->num_angle;
 
   // get custom property arrays
-  int *hyb_status = atom->ivector[hyb_status_index];
+  int *hyb_status_5p = atom->ivector[hyb_status_5p_index];
+  int *hyb_status_3p = atom->ivector[hyb_status_3p_index];
   int *is_crossover = atom->ivector[is_crossover_index];
   int *size = atom->ivector[size_index];
 
@@ -198,8 +205,8 @@ void FixDnafoldAngleHyb::create_angles()
   // === Build global bond-type lookup via MPI_Allgatherv ===
   // With newton_bond on, each local atom owns bonds where it is the lower-tagged atom.
   // Ghost atom bond data is unreliable; use this map for ghost-owned bonds.
-  int *num_bond     = atom->num_bond;
-  int **btype_arr   = atom->bond_type;
+  int *num_bond      = atom->num_bond;
+  int **btype_arr    = atom->bond_type;
   tagint **batom_arr = atom->bond_atom;
 
   std::vector<tagint> local_t1, local_t2;
@@ -252,12 +259,11 @@ void FixDnafoldAngleHyb::create_angles()
     if (!(mask[i] & groupbit)) continue;
 
     // only create angles for fully hybridized atoms
-    // fully hybridized means hyb_status equals the atom's size
-    if (hyb_status[i] != size[i]) continue;
+    // fully hybridized: both sides occupied for full bead (sum==2), one side for half bead (sum==1)
+    if (hyb_status_5p[i] + hyb_status_3p[i] != size[i]) continue;
 
     tagint itag = tag[i];
 
-    // angle type depends on whether center atom is at a crossover junction
     // type 1 = normal angle, type 2 = crossover angle
     int atype = 1 + is_crossover[i];
 
@@ -276,7 +282,7 @@ void FixDnafoldAngleHyb::create_angles()
       if (!(mask[nloc] & groupbit)) continue;
 
       // neighbor must also be fully hybridized
-      if (hyb_status[nloc] != size[nloc]) continue;
+      if (hyb_status_5p[nloc] + hyb_status_3p[nloc] != size[nloc]) continue;
 
       // bond between center atom i and this neighbor must be type 1
       // lower-tagged atom owns the bond (newton_bond on); use global map for ghost-owned bonds
@@ -370,7 +376,7 @@ bool FixDnafoldAngleHyb::has_bond(int i, int j)
 
 /* ----------------------------------------------------------------------
    Check if angle i-j-k already exists on center atom j.
-   Angles are stored on the center atom, so we only need to check j's list.
+   Angles are stored on the center atom, so only check j's list.
 ------------------------------------------------------------------------- */
 
 bool FixDnafoldAngleHyb::has_angle(int i, int j, int k)

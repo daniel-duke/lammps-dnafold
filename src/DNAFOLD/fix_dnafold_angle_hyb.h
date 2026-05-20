@@ -12,7 +12,7 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
@@ -45,7 +45,8 @@ class FixDnafoldAngleHyb : public Fix {
   int me, nprocs;
 
   // === Property indices ===
-  int hyb_status_index;
+  int hyb_status_5p_index;
+  int hyb_status_3p_index;
   int is_crossover_index;
   int size_index;
 
@@ -53,7 +54,6 @@ class FixDnafoldAngleHyb : public Fix {
   double max_angle_deviation;
 
   // === Counters ===
-  // Output vector: [0]=created, [1]=total_created
   int create_count;
   bigint create_count_total;
 

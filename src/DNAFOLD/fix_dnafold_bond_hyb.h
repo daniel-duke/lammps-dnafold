@@ -12,7 +12,7 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
@@ -61,8 +61,8 @@ class FixDnafoldBondHyb : public Fix {
   char *complementarity_file;
 
   // === Property indices ===
-  int hyb_status_index;
-  int size_index;
+  int hyb_status_5p_index;
+  int hyb_status_3p_index;
 
   // === Temperature data ===
   std::vector<double> temperatures;
@@ -71,24 +71,22 @@ class FixDnafoldBondHyb : public Fix {
   int tvar_index;
 
   // === Complementarity data ===
-  // Hash function for pair of tagints
+  struct PairData {
+    int half_i;
+    int half_j;
+    std::vector<double> energies;
+  };
   struct PairHash {
     std::size_t operator()(const std::pair<tagint, tagint> &p) const {
       return std::hash<tagint>()(p.first) ^ (std::hash<tagint>()(p.second) << 1);
     }
   };
-  // Map: (tag1, tag2) -> vector of energies at each temperature
-  // tag1 < tag2 always for consistent lookup
-  std::unordered_map<std::pair<tagint, tagint>, std::vector<double>, PairHash> complementarity_map;
-
-  // Energy levels: sorted pairs of (energy_depth, bond_type)
-  // Sorted in descending order by energy_depth (highest energy = strongest bond)
+  std::unordered_map<std::pair<tagint, tagint>, PairData, PairHash> complementarity_map;
   std::vector<std::pair<double, int>> energy_levels;
 
   // === Counters ===
-  // Output vector: [0]=created, [1]=total_created, [2]=downgraded, [3]=total_downgraded
   int create_count, downgrade_count;
-  int update_count;    // bond type updates due to temperature change (not in output vector)
+  int update_count;
   bigint create_count_total, downgrade_count_total;
 
   // === Communication arrays ===
@@ -101,9 +99,12 @@ class FixDnafoldBondHyb : public Fix {
   int commflag;
 
   // === Per-timestep shared state ===
-  // Accumulates hyb_status changes for ghost atoms across both phases;
-  // broadcast to home processors via MPI_Allgatherv after all phases complete.
-  std::vector<std::pair<tagint,int>> hyb_status_changes;
+  struct HybStatusChange {
+    tagint tag;
+    int delta_5p;
+    int delta_3p;
+  };
+  std::vector<HybStatusChange> hyb_status_changes;
 
   // === Helper functions ===
   void downgrade_bonds();
@@ -112,7 +113,7 @@ class FixDnafoldBondHyb : public Fix {
   void read_complementarity_file();
   double get_interpolated_energy(tagint, tagint);
   int get_bond_type(tagint, tagint);
-  double get_energy_depth(tagint, tagint);
+std::pair<int,int> get_halves(tagint, tagint);
   void remove_dummy_bond(int, int);
   bool is_hyb_bond_type(int btype);
 };

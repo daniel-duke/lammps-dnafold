@@ -12,7 +12,7 @@
 ------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------
-   DNAFOLD package: Coarse-grained DNA origami folding simulation
+   DNAFOLD package: Mesoscopic DNA origami folding simulation
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
@@ -55,7 +55,6 @@ class FixDnafoldBondHalf : public Fix {
   int size_index;
 
   // === Counters ===
-  // Output vector: [0]=created, [1]=broken, [2]=total_created, [3]=total_broken
   int create_count, break_count;
   bigint create_count_total, break_count_total;
 
