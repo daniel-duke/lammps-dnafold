@@ -276,14 +276,14 @@ void FixDnafoldBondHyb::read_complementarity_file()
       }
 
       // parse PAIRS section: read complementary atom pairs with per-temperature energies
-      // format: tag1 tag2 <ignored_column> half_i half_j energy1 energy2 ...
+      // format: tag1 tag2 half_i half_j <ignored> energy1 energy2 ...
       if (current_section == PAIRS) {
         std::istringstream iss(line);
         tagint tag1, tag2;
-        std::string ignored_column;
+        std::string ignored;
         int half_i_val, half_j_val;
 
-        if (!(iss >> tag1 >> tag2 >> ignored_column >> half_i_val >> half_j_val)) {
+        if (!(iss >> tag1 >> tag2 >> half_i_val >> half_j_val >> ignored)) {
           error->one(FLERR,fmt::format("Invalid PAIRS format in '{}' at line {}",
                                        complementarity_file, line_num));
         }
